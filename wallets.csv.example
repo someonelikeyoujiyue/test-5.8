@@ -1,0 +1,3 @@
+Address,privateKey,Mnemonic
+0xYourEvmAddress1,0xprivateKeyHexHere1,word1 word2 word3 ... word12
+0xYourEvmAddress2,0xprivateKeyHexHere2,word1 word2 word3 ... word12

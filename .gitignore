@@ -1,0 +1,45 @@
+# 依赖 / 编译产物
+node_modules/
+
+# 钱包敏感 (核心)
+wallets.csv
+wallets-generated.csv
+.salt
+
+# 运行时密码 / API key
+.env
+.env.*
+!.env.example
+
+# 代理凭据
+ip.txt
+*proxies*.txt
+*proxy*.txt
+
+# 状态文件
+state.json
+state.json.bak
+state.json.tmp
+.rho-trade.pid
+
+# 日志
+logs/
+*.log
+
+# 抓包/调试 dump
+quote.txt
+login.txt
+*Account.txt
+*deposit*.txt
+*deposite*.txt
+
+# binance-withdraw 的输入文件 (放错位置)
+inputBinance*.csv
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
