@@ -45,9 +45,10 @@ export const config = {
     // ---- 策略 1: 秒开秒关 ----
     instant: {
         // 候选 prefix (UNION 模式, 任一前缀命中即纳入候选池)
-        // 注意: "RHO-" 只有 RHO-BTCUSDT / RHO-ETHUSDT 共 2 个 market,
-        // 不够 minDistinctMarketsPerWeek=3, 必须扩到其他交易所前缀.
-        symbolPrefixes: ["RHO-", "BINANCE-", "OKX-", "BYBIT-", "ASTER-"],
+        // 排除 ASTER (流动性薄, 单笔吃多档导致磨损 -$1+/笔)
+        // 排除 BYBIT (同样发现磨损偏高)
+        // 保留 RHO/BINANCE/OKX × {BTC,ETH} = 6 个 market, 仍 > minDistinctMarketsPerWeek=3
+        symbolPrefixes: ["RHO-", "BINANCE-", "OKX-"],
 
         // 接受的标的资产
         underlyings: ["BTC", "ETH"],
