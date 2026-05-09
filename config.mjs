@@ -64,9 +64,13 @@ export const config = {
         // 开/平之间的间隔 (毫秒); 0 表示立即
         gapMs: 200,
 
-        // 平仓后是否查 positions 校验归零
+        // 平仓后是否查 positions 校验归零 (新版默认靠 vol 比对, 不再额外查 API)
         verifyClose: true,
         verifyDelayMs: 1500,
+
+        // 平仓 partial fill 时最多重试几 pass (确保 open vol == close vol)
+        // 单 pass 内 IOC 单不补单成交, 等 300ms 让 LP 补单后再下一 pass
+        maxClosePasses: 3,
 
         // 多样性约束: 一周内每钱包至少交易 N 个不同 market (项目方任务要求 = 3)
         // 当 lookback 内已交易 market 数 < minDistinctMarketsPerWeek,

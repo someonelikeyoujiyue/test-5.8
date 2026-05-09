@@ -213,65 +213,86 @@ export async function execute(client, ctx) {
     if (!openTrade) {
         return { ok: false, error: `open: no trade in resp: ${JSON.stringify(openResp).slice(0, 200)}` };
     }
-    log(`open  fill price=${openTrade.price} fee=${openTrade.tradingFees} orderId=${openTrade.orderId}`);
+    const openVol = parseFloat(openTrade.volume);
+    log(`open  fill price=${openTrade.price} vol=${openVol} fee=${openTrade.tradingFees} orderId=${openTrade.orderId}`);
 
     // 2) 极短间隔避免 race (可调)
     if (cfg.gapMs > 0) await sleep(cfg.gapMs);
 
-    // 3) 平仓 (close-position flag, 不带 side)
-    let closeResp;
-    try {
-        closeResp = await client.createOrder({
-            orderType: "market",
-            symbol: sym.symbol,
-            timeInForce: "IOC",
-            flags: ["close-position"],
-            clientOrderId: cidBase + "c",
-        });
-    } catch (e) {
-        return {
-            ok: false,
-            error: `close: ${formatErr(e)} (open 已成交, 注意手动平仓!)`,
-            open: tradeRecord(openTrade),
-        };
-    }
-    const closeTrade = closeResp.trades?.[0];
-    if (!closeTrade) {
-        return {
-            ok: false,
-            error: `close: no trade in resp; positions 可能未归零`,
-            open: tradeRecord(openTrade),
-        };
-    }
-    log(`close fill price=${closeTrade.price} fee=${closeTrade.tradingFees} orderId=${closeTrade.orderId}`);
+    // 3) 平仓: 反向 side + 与 open 完全等量 (不用 close-position flag)
+    //    这样只平掉刚开的这一笔, 不会动到该钱包此前可能的遗留持仓.
+    //    若 close 部分成交, 重试最多 maxClosePasses 次直到 totalClosed >= openVol.
+    const closeSide = side === "buy" ? "sell" : "buy";
+    const maxPasses = cfg.maxClosePasses ?? 3;
+    let totalClosed = 0;
+    let lastClose = null;
+    let totalCloseFee = 0;
+    const closeFills = [];
 
-    // 4) 校验 positions 归零 (可选)
-    let positionsClean = null;
-    if (cfg.verifyClose) {
-        await sleep(cfg.verifyDelayMs ?? 1000);
+    for (let pass = 1; pass <= maxPasses; pass++) {
+        const remaining = openVol - totalClosed;
+        if (remaining <= 0.01) break;   // 已经平完 (留 0.01 容差应付浮点)
+        const closeCid = (cidBase + "c" + (pass > 1 ? pass : "")).slice(0, 36);
+        let resp;
         try {
-            const pos = (await client.getPositions()).positions ?? [];
-            const stillOpen = pos.find(p =>
-                p.symbol === sym.symbol && parseFloat(p.notional) !== 0
-            );
-            positionsClean = !stillOpen;
-            if (stillOpen) {
-                log(`!! 校验失败: ${sym.symbol} 仓位未归零, notional=${stillOpen.notional}`);
-            }
+            resp = await client.createOrder({
+                orderType: "market",
+                symbol: sym.symbol,
+                side: closeSide,
+                quantity: String(remaining),
+                timeInForce: "IOC",
+                clientOrderId: closeCid,
+            });
         } catch (e) {
-            log(`校验持仓 err: ${formatErr(e)}`);
+            return {
+                ok: false,
+                error: `close pass${pass}: ${formatErr(e)} (open 已成交 vol=${openVol}, 残留 ${remaining.toFixed(4)})`,
+                open: tradeRecord(openTrade),
+            };
         }
+        const tr = resp.trades?.[0];
+        if (!tr) {
+            // 没成交记录但 API 没报错; 可能盘口空了, 跳出循环
+            log(`  close pass${pass}: 无成交 (返回 trades 空), 残留 ${remaining.toFixed(4)}`);
+            break;
+        }
+        const v = parseFloat(tr.volume);
+        totalClosed += v;
+        totalCloseFee += parseFloat(tr.tradingFees) || 0;
+        lastClose = tr;
+        closeFills.push(tradeRecord(tr));
+        log(`close ${pass>1?`(pass${pass})`:""} fill price=${tr.price} vol=${v} fee=${tr.tradingFees}${totalClosed < openVol ? ` (累计 ${totalClosed}/${openVol})` : ""}`);
+        if (totalClosed >= openVol - 0.01) break;
+        await sleep(300);   // 等 LP 补单
     }
 
+    const residual = openVol - totalClosed;
+    let positionsClean = Math.abs(residual) < 0.01;
+    if (!positionsClean) {
+        log(`!! 残留 vol=${residual.toFixed(4)} (open ${openVol}, 累计 close ${totalClosed.toFixed(4)}); ${maxPasses} 次重试仍未平完`);
+    }
+
+    if (!lastClose) {
+        return {
+            ok: false,
+            error: `close: 0 次成交 (open vol=${openVol} 全部残留, 用 cleanup.mjs 扫)`,
+            open: tradeRecord(openTrade),
+        };
+    }
+
+    // close 字段记录最后一笔; closeFills 记录所有 pass (调试用)
     return {
-        ok: true,
+        ok: positionsClean,    // 残留视为 fail (好让 trade.mjs 重试)
         symbol: sym.symbol,
         underlying: sym.underlyingAsset,
         maturity: sym.maturityDate,
         open: tradeRecord(openTrade),
-        close: tradeRecord(closeTrade),
+        close: tradeRecord(lastClose),
+        closeFills: closeFills.length > 1 ? closeFills : undefined,
         positionsClean,
-        pnl: estimatePnl(openTrade, closeTrade, side),
+        residual: residual.toFixed(4),
+        totalClosed: totalClosed.toFixed(4),
+        pnl: estimatePnlAcc(openTrade, lastClose, side, openVol, totalClosed, totalCloseFee),
     };
 }
 
@@ -292,6 +313,17 @@ function estimatePnl(open, close, openSide) {
     const pnl = (parseFloat(close.price) - parseFloat(open.price)) * parseFloat(open.volume) * dir;
     const fees = parseFloat(open.tradingFees) + parseFloat(close.tradingFees);
     return { gross: pnl.toFixed(4), fees: fees.toFixed(4), net: (pnl + fees).toFixed(4) };
+}
+
+// 多次 close pass 的累计 pnl (用最后 close price 近似, 更精确要按每 pass 加权)
+function estimatePnlAcc(open, lastClose, openSide, openVol, totalClosed, totalCloseFee) {
+    const dir = openSide === "buy" ? 1 : -1;
+    const closePx = parseFloat(lastClose.price);
+    const openPx = parseFloat(open.price);
+    const gross = (closePx - openPx) * totalClosed * dir;
+    const openFee = parseFloat(open.tradingFees) || 0;
+    const fees = openFee + totalCloseFee;
+    return { gross: gross.toFixed(4), fees: fees.toFixed(4), net: (gross + fees).toFixed(4) };
 }
 
 function formatErr(e) {
