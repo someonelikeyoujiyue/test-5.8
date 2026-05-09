@@ -43,9 +43,27 @@ function tradedMarkets({ state, address, today, lookback, boundary, strategyName
     return markets;
 }
 
-// 选 symbol: prefix UNION + underlying 过滤 + 活跃 + 多样性强制
-function selectSymbol(exchangeInfo, opts) {
-    const { prefixes, underlyings, notional, traded, minDistinct } = opts;
+// 检查 ticker 盘口是否合格 (秒开秒关需要紧 spread + 充足深度)
+function passesLiquidityCheck(ticker, opts) {
+    if (!ticker) return { ok: false, why: "no-ticker" };
+    const bid = parseFloat(ticker.bidPrice);
+    const ask = parseFloat(ticker.askPrice);
+    const bidSize = parseFloat(ticker.bidSize);
+    const askSize = parseFloat(ticker.askSize);
+    if (![bid, ask, bidSize, askSize].every(Number.isFinite)) {
+        return { ok: false, why: "incomplete-ticker" };
+    }
+    const spread = ask - bid;
+    if (spread > opts.maxSpread) return { ok: false, why: `spread ${spread.toFixed(4)} > ${opts.maxSpread}` };
+    const need = opts.notional * opts.minLiquidityMultiplier;
+    if (bidSize < need) return { ok: false, why: `bidSize ${bidSize} < ${need}` };
+    if (askSize < need) return { ok: false, why: `askSize ${askSize} < ${need}` };
+    return { ok: true, spread, bidSize, askSize };
+}
+
+// 选 symbol: prefix UNION + underlying 过滤 + 活跃 + spread/流动性 + 多样性强制
+function selectSymbol(exchangeInfo, tickers, opts) {
+    const { prefixes, underlyings, notional, traded, minDistinct, maxSpread, minLiquidityMultiplier } = opts;
     let candidates = exchangeInfo.symbols.filter(s => {
         if (s.isExpired || s.isLockedUp || s.pausedOrders) return false;
         if (parseFloat(s.minTradeNotional) > notional) return false;
@@ -59,6 +77,21 @@ function selectSymbol(exchangeInfo, opts) {
         candidates = candidates.filter(s => prefixes.some(p => s.symbol.startsWith(p)));
     }
     if (!candidates.length) return null;
+
+    // spread + 流动性过滤 (秒开秒关核心: 深度不够会吃多档滑点)
+    if (tickers && (maxSpread != null || minLiquidityMultiplier != null)) {
+        const liqOpts = {
+            maxSpread: maxSpread ?? Infinity,
+            notional,
+            minLiquidityMultiplier: minLiquidityMultiplier ?? 1,
+        };
+        const filtered = candidates.filter(s => passesLiquidityCheck(tickers[s.symbol], liqOpts).ok);
+        if (filtered.length === 0) {
+            // 全部不合格, 返回 null 让上层 skip 此钱包 (而非乱选)
+            return null;
+        }
+        candidates = filtered;
+    }
 
     // 多样性: 已交易市场数 < minDistinct → 优先未交易过的候选
     const tradedCount = traded?.size ?? 0;
@@ -93,7 +126,7 @@ function pickNotional(cfg) {
 }
 
 export async function execute(client, ctx) {
-    const { wallet, log, config, exchangeInfo, state, today, dayBoundary } = ctx;
+    const { wallet, log, config, exchangeInfo, tickers, state, today, dayBoundary } = ctx;
     const cfg = config.instant;
     const lookback = cfg.lookbackDays ?? 7;
     const minDistinct = cfg.minDistinctMarketsPerWeek ?? 3;
@@ -111,15 +144,23 @@ export async function execute(client, ctx) {
     // 本次随机 notional (区间内一次决定, 整笔 open+close 用同一个值)
     const notional = pickNotional(cfg);
 
-    const sym = selectSymbol(exchangeInfo, {
+    const sym = selectSymbol(exchangeInfo, tickers, {
         prefixes: cfg.symbolPrefixes,
         underlyings: cfg.underlyings,
         notional,
         traded,
         minDistinct,
+        maxSpread: cfg.maxSpread,
+        minLiquidityMultiplier: cfg.minLiquidityMultiplier,
     });
     if (!sym) {
-        return { ok: false, error: "no candidate symbol" };
+        return { ok: false, error: `no candidate symbol (spread<=${cfg.maxSpread}, liq>=${notional}*${cfg.minLiquidityMultiplier})`, retryable: true };
+    }
+    // 把命中的 ticker 信息打出来便于核对
+    const t = tickers?.[sym.symbol];
+    if (t) {
+        const spread = (parseFloat(t.askPrice) - parseFloat(t.bidPrice)).toFixed(4);
+        log(`pick ${sym.symbol} spread=${spread} bid=${t.bidPrice}@${t.bidSize} ask=${t.askPrice}@${t.askSize}`);
     }
 
     const side = pickSide(cfg);

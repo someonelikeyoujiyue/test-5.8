@@ -4,7 +4,7 @@ import { dirname, join } from "path";
 import { HttpsProxyAgent } from "https-proxy-agent";
 
 import { askPassword, loadWallets } from "./lib/cipher.mjs";
-import { RhoClient, fetchExchangeInfo } from "./lib/rho.mjs";
+import { RhoClient, fetchExchangeInfo, fetchAllTickersMap } from "./lib/rho.mjs";
 import { loadState, saveState, dayKey, getRun, setRun, summary } from "./lib/state.mjs";
 import { getStrategy } from "./strategies/index.mjs";
 import { createShutdownSignal, computeNextRun, sleepUntil, fmtDuration } from "./lib/scheduler.mjs";
@@ -89,7 +89,7 @@ async function cleanupCandidates(candidates, today, stratName, state) {
     return { closed, errors };
 }
 
-async function runPerWallet({ wallet, strategy, exchangeInfo, state, today, dayBoundary }) {
+async function runPerWallet({ wallet, strategy, exchangeInfo, tickers, state, today, dayBoundary }) {
     const tag = `[${wallet.address.slice(0, 10)}]`;
     const log = msg => console.log(`[${ts()}] ${tag} ${msg}`);
     let client;
@@ -97,7 +97,7 @@ async function runPerWallet({ wallet, strategy, exchangeInfo, state, today, dayB
     catch (e) { log(`login 失败: ${errMsg(e)}`); return { ok: false, error: `login: ${errMsg(e)}` }; }
     if (config.dryRun) { log("[DRY] 跳过实际下单 (config.dryRun=true)"); return { ok: false, error: "dryRun" }; }
     try {
-        const r = await strategy.execute(client, { wallet, log, config, exchangeInfo, state, today, dayBoundary });
+        const r = await strategy.execute(client, { wallet, log, config, exchangeInfo, tickers, state, today, dayBoundary });
         if (r.ok) log(`✓ 完成 ${r.symbol} pnl(net)=${r.pnl?.net} positionsClean=${r.positionsClean}`);
         else log(`✗ 失败: ${r.error}`);
         return r;
@@ -107,7 +107,7 @@ async function runPerWallet({ wallet, strategy, exchangeInfo, state, today, dayB
     }
 }
 
-async function runStrategy({ strategy, stratName, wallets, exchangeInfo, state, today, stateFile, shutdown }) {
+async function runStrategy({ strategy, stratName, wallets, exchangeInfo, tickers, state, today, stateFile, shutdown }) {
     const candidates = [];
     let skipped = 0;
     for (const w of wallets) {
@@ -128,7 +128,7 @@ async function runStrategy({ strategy, stratName, wallets, exchangeInfo, state, 
         const log = msg => console.log(`[${ts()}] [group] ${msg}`);
         const results = await strategy.executeGroup({
             candidates, getClient: w => buildClient(w),
-            exchangeInfo, config, log,
+            exchangeInfo, tickers, config, log,
             state, today, dayBoundary: config.dayBoundary,
         });
         for (const r of results) {
@@ -148,7 +148,7 @@ async function runStrategy({ strategy, stratName, wallets, exchangeInfo, state, 
                     if (shutdown?.requested) return;
                     const w = tasks.shift();
                     if (!w) break;
-                    const r = await runPerWallet({ wallet: w, strategy, exchangeInfo, state, today, dayBoundary: config.dayBoundary });
+                    const r = await runPerWallet({ wallet: w, strategy, exchangeInfo, tickers, state, today, dayBoundary: config.dayBoundary });
                     setRun(state, w.address, today, stratName, {
                         strategy: stratName,
                         status: r.ok ? "ok" : "failed",
@@ -171,13 +171,16 @@ async function runOneCycle({ strategy, stratName, wallets, state, stateFile, shu
     const cycleStart = Date.now();
     const today = dayKey(new Date(), config.dayBoundary || "local");
 
-    let exchangeInfo;
+    let exchangeInfo, tickers;
     try {
-        exchangeInfo = await fetchExchangeInfo(config.apiBase);
-        console.log(`[${ts()}] exchange/info: ${exchangeInfo.symbols?.length} 个 symbol`);
-    } catch (e) { console.log(`[${ts()}] exchange/info 失败 (本轮放弃): ${errMsg(e)}`); return; }
+        [exchangeInfo, tickers] = await Promise.all([
+            fetchExchangeInfo(config.apiBase),
+            fetchAllTickersMap(config.apiBase),
+        ]);
+        console.log(`[${ts()}] exchange/info: ${exchangeInfo.symbols?.length} 个 symbol | tickers: ${Object.keys(tickers).length}`);
+    } catch (e) { console.log(`[${ts()}] exchange/info / tickers 失败 (本轮放弃): ${errMsg(e)}`); return; }
 
-    const r = await runStrategy({ strategy, stratName, wallets, exchangeInfo, state, today, stateFile, shutdown });
+    const r = await runStrategy({ strategy, stratName, wallets, exchangeInfo, tickers, state, today, stateFile, shutdown });
     const elapsed = Date.now() - cycleStart;
     const s = summary(state, today, stratName);
     console.log(`[${ts()}] 本轮: 成功 ${r.ok} | 失败 ${r.fail} | 用时 ${fmtDuration(elapsed)}`);

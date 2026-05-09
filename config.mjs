@@ -72,6 +72,13 @@ export const config = {
         // 强制从未交易过的候选池挑选; 满足后回归纯随机
         minDistinctMarketsPerWeek: 3,
         lookbackDays: 7,
+
+        // 秒开秒关 spread + 流动性约束 (避免吃多档滑点)
+        // spread 单位是利率 (rate), 0.01 = 1% 价差
+        maxSpread: 0.01,
+        // bidSize 和 askSize 都需 ≥ notional × multiplier
+        // 1.0 = 刚好够; 1.5 = 留 50% 安全垫 (避免吃完 top of book)
+        minLiquidityMultiplier: 1.5,
     },
 
     // ---- 策略 2: 配平 (balance / wash) ----
