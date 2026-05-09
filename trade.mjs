@@ -5,7 +5,7 @@ import { HttpsProxyAgent } from "https-proxy-agent";
 
 import { askPassword, loadWallets } from "./lib/cipher.mjs";
 import { RhoClient, fetchExchangeInfo, fetchAllTickersMap } from "./lib/rho.mjs";
-import { loadState, saveState, dayKey, getRun, setRun, summary } from "./lib/state.mjs";
+import { loadState, saveState, dayKey, getDayRuns, countOk, appendRun, summary } from "./lib/state.mjs";
 import { getStrategy } from "./strategies/index.mjs";
 import { createShutdownSignal, computeNextRun, sleepUntil, fmtDuration } from "./lib/scheduler.mjs";
 import { config } from "./config.mjs";
@@ -107,17 +107,20 @@ async function runPerWallet({ wallet, strategy, exchangeInfo, tickers, state, to
     }
 }
 
-async function runStrategy({ strategy, stratName, wallets, exchangeInfo, tickers, state, today, stateFile, shutdown }) {
+async function runStrategy({ strategy, stratName, wallets, exchangeInfo, tickers, state, today, stateFile, shutdown, runsPerDay }) {
+    // runsPerDay: CLI override; 否则按 config (策略级别 cfg.runsPerDay) 默认 1
+    const target = runsPerDay ?? config[stratName]?.runsPerDay ?? 1;
+
+    // 候选: 今日 ok 数 < target 的都算; ok 已满则跳过
     const candidates = [];
     let skipped = 0;
     for (const w of wallets) {
-        const r = getRun(state, w.address, today, stratName);
-        if (r?.status === "ok") { skipped++; continue; }
-        if (r?.status === "failed" && !config.retryFailed) { skipped++; continue; }
+        const okCount = countOk(state, w.address, today, stratName);
+        if (okCount >= target) { skipped++; continue; }
         candidates.push(w);
     }
     console.log(`[${ts()}] 今日 ${today} (TZ=${config.dayBoundary || "local"}) | 策略=${stratName} (${strategy.meta?.type})`);
-    console.log(`[${ts()}] 钱包总数: ${wallets.length} | 今日已完成跳过: ${skipped} | 候选: ${candidates.length}`);
+    console.log(`[${ts()}] 钱包总数: ${wallets.length} | 已满 ${target} 次跳过: ${skipped} | 候选: ${candidates.length}`);
     if (!candidates.length) { console.log(`[${ts()}] 无候选钱包, 跳过本轮\n`); return { ok: 0, fail: 0 }; }
     if (config.dryRun) { console.log(`[${ts()}] dryRun=true, 跳过实际执行\n`); return { ok: 0, fail: 0 }; }
 
@@ -125,6 +128,7 @@ async function runStrategy({ strategy, stratName, wallets, exchangeInfo, tickers
     await cleanupCandidates(candidates, today, stratName, state);
 
     if (strategy.meta?.type === "group") {
+        // group 策略 (balance) 暂不支持多次/天, 走原逻辑
         const log = msg => console.log(`[${ts()}] [group] ${msg}`);
         const results = await strategy.executeGroup({
             candidates, getClient: w => buildClient(w),
@@ -132,33 +136,40 @@ async function runStrategy({ strategy, stratName, wallets, exchangeInfo, tickers
             state, today, dayBoundary: config.dayBoundary,
         });
         for (const r of results) {
-            setRun(state, r.address, today, stratName, r.record);
+            appendRun(state, r.address, today, stratName, r.record);
             saveState(stateFile, state);
         }
         const ok = results.filter(r => r.record.status === "ok").length;
         return { ok, fail: results.length - ok };
     } else {
+        // perWallet 策略 (instant) 支持每钱包跑到 target 次
+        // 工作池: 每个 worker 完整跑完一个钱包的所有 remaining 笔, 再拿下一个
         const tasks = [...candidates];
         const workers = [];
-        let ok = 0, fail = 0, done = 0;
-        const total = tasks.length;
+        let ok = 0, fail = 0, doneRuns = 0;
         for (let i = 0; i < Math.min(config.concurrency, tasks.length); i++) {
             workers.push((async () => {
                 while (tasks.length) {
                     if (shutdown?.requested) return;
                     const w = tasks.shift();
                     if (!w) break;
-                    const r = await runPerWallet({ wallet: w, strategy, exchangeInfo, tickers, state, today, dayBoundary: config.dayBoundary });
-                    setRun(state, w.address, today, stratName, {
-                        strategy: stratName,
-                        status: r.ok ? "ok" : "failed",
-                        ts: new Date().toISOString(),
-                        ...r,
-                    });
-                    saveState(stateFile, state);
-                    if (r.ok) ok++; else fail++;
-                    done++;
-                    if (done % 50 === 0) console.log(`[${ts()}] 进度 ${done}/${total} (ok=${ok} fail=${fail})`);
+                    // 该钱包还差几笔
+                    const okSoFar = countOk(state, w.address, today, stratName);
+                    const remaining = Math.max(0, target - okSoFar);
+                    for (let n = 0; n < remaining; n++) {
+                        if (shutdown?.requested) return;
+                        const r = await runPerWallet({ wallet: w, strategy, exchangeInfo, tickers, state, today, dayBoundary: config.dayBoundary });
+                        appendRun(state, w.address, today, stratName, {
+                            strategy: stratName,
+                            status: r.ok ? "ok" : "failed",
+                            ts: new Date().toISOString(),
+                            ...r,
+                        });
+                        saveState(stateFile, state);
+                        if (r.ok) ok++; else fail++;
+                        doneRuns++;
+                        if (doneRuns % 50 === 0) console.log(`[${ts()}] 进度 ${doneRuns} runs (ok=${ok} fail=${fail})`);
+                    }
                 }
             })());
         }
@@ -167,7 +178,7 @@ async function runStrategy({ strategy, stratName, wallets, exchangeInfo, tickers
     }
 }
 
-async function runOneCycle({ strategy, stratName, wallets, state, stateFile, shutdown }) {
+async function runOneCycle({ strategy, stratName, wallets, state, stateFile, shutdown, runsPerDay }) {
     const cycleStart = Date.now();
     const today = dayKey(new Date(), config.dayBoundary || "local");
 
@@ -180,28 +191,30 @@ async function runOneCycle({ strategy, stratName, wallets, state, stateFile, shu
         console.log(`[${ts()}] exchange/info: ${exchangeInfo.symbols?.length} 个 symbol | tickers: ${Object.keys(tickers).length}`);
     } catch (e) { console.log(`[${ts()}] exchange/info / tickers 失败 (本轮放弃): ${errMsg(e)}`); return; }
 
-    const r = await runStrategy({ strategy, stratName, wallets, exchangeInfo, tickers, state, today, stateFile, shutdown });
+    const r = await runStrategy({ strategy, stratName, wallets, exchangeInfo, tickers, state, today, stateFile, shutdown, runsPerDay });
     const elapsed = Date.now() - cycleStart;
-    const s = summary(state, today, stratName);
+    const target = runsPerDay ?? config[stratName]?.runsPerDay ?? 1;
+    const s = summary(state, today, stratName, target);
     console.log(`[${ts()}] 本轮: 成功 ${r.ok} | 失败 ${r.fail} | 用时 ${fmtDuration(elapsed)}`);
-    console.log(`[${ts()}] 今日累计 ${stratName}: ok ${s.ok} | failed ${s.failed} | 钱包数 ${s.addresses}\n`);
+    console.log(`[${ts()}] 今日累计 ${stratName}: ok runs=${s.ok} | failed=${s.failed} | 已满 ${target} 笔的钱包: ${s.walletsCompleted}/${s.addresses}\n`);
 }
 
-async function daemon({ strategy, stratName, wallets, state, stateFile, shutdown }) {
+async function daemon({ strategy, stratName, wallets, state, stateFile, shutdown, runsPerDay }) {
     const sched = config.schedule;
 
     while (!shutdown.requested) {
-        // 是否需要立即跑: 今日还没全部 ok
+        // 是否需要立即跑: 今日有钱包未达 target 笔
         const today = dayKey(new Date(), config.dayBoundary || "local");
-        const s = summary(state, today, stratName);
-        const todayDone = s.addresses > 0 && s.addresses === s.ok;
+        const target = runsPerDay ?? config[stratName]?.runsPerDay ?? 1;
+        const s = summary(state, today, stratName, target);
+        const todayDone = s.addresses > 0 && s.walletsCompleted === wallets.length;
 
         if (!todayDone) {
-            console.log(`[${ts()}] === 启动/补跑 cycle (today=${today}) ===`);
-            try { await runOneCycle({ strategy, stratName, wallets, state, stateFile, shutdown }); }
+            console.log(`[${ts()}] === 启动/补跑 cycle (today=${today}, target=${target}) ===`);
+            try { await runOneCycle({ strategy, stratName, wallets, state, stateFile, shutdown, runsPerDay }); }
             catch (e) { console.error(`[${ts()}] cycle 异常 (已隔离, 进程继续):`, e); }
         } else {
-            console.log(`[${ts()}] 今日 ${today} 已全部完成 (ok=${s.ok}/${s.addresses}), 跳过`);
+            console.log(`[${ts()}] 今日 ${today} 已全部完成 (${s.walletsCompleted}/${wallets.length} 钱包均达 ${target} 次)`);
         }
 
         if (shutdown.requested) break;
@@ -233,8 +246,16 @@ function parseSelectors(args, max) {
 
 async function main() {
     const args = process.argv.slice(2);
-    const flags = new Set(args.filter(a => a.startsWith("--")));
+    const allFlags = args.filter(a => a.startsWith("--"));
+    const flags = new Set(allFlags.filter(a => !a.includes("=")));   // 简单 flag 不含 =
     const positional = args.filter(a => !a.startsWith("--"));
+
+    // --runs=N: 临时覆盖该策略当日跑 N 次 (config 里 runsPerDay 默认 1)
+    let runsOverride = null;
+    for (const f of allFlags) {
+        const m = f.match(/^--runs=(\d+)$/);
+        if (m) runsOverride = parseInt(m[1]);
+    }
 
     // 第一个位置参数: 如果不像数字, 当作策略名; 否则当作钱包选择器
     let stratName = config.strategy;
@@ -252,8 +273,10 @@ async function main() {
     const runOnce = explicitOnce || (!explicitDaemon && hasSelector);
 
     const strategy = getStrategy(stratName);
+    const effectiveRuns = runsOverride ?? config[stratName]?.runsPerDay ?? 1;
 
     console.log(`=== Rho-X 自动交易${runOnce ? " (一次性)" : " daemon"} / 策略: ${stratName} (${strategy.meta?.type}) ===`);
+    console.log(`runsPerDay = ${effectiveRuns}${runsOverride ? " (CLI --runs 覆盖)" : " (config 默认)"}`);
     if (!runOnce) {
         console.log(`schedule: 每天 ${String(config.schedule.hourLocal).padStart(2, "0")}:${String(config.schedule.minuteLocal).padStart(2, "0")} (本地) +0..${config.schedule.jitterMinutes}m jitter`);
     }
@@ -284,10 +307,10 @@ async function main() {
 
     if (runOnce) {
         // 一次性: 立刻跑一轮就退出
-        try { await runOneCycle({ strategy, stratName, wallets, state, stateFile, shutdown }); }
+        try { await runOneCycle({ strategy, stratName, wallets, state, stateFile, shutdown, runsPerDay: runsOverride }); }
         catch (e) { console.error(`[${ts()}] cycle 异常:`, e); }
     } else {
-        await daemon({ strategy, stratName, wallets, state, stateFile, shutdown });
+        await daemon({ strategy, stratName, wallets, state, stateFile, shutdown, runsPerDay: runsOverride });
     }
 
     saveState(stateFile, state);

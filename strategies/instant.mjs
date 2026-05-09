@@ -7,7 +7,7 @@
 //
 // meta.type = "perWallet", trade.mjs 给每个钱包独立调用 execute(client, ctx)
 
-import { dayKey } from "../lib/state.mjs";
+import { dayKey, getDayRuns } from "../lib/state.mjs";
 
 export const meta = { type: "perWallet", perDay: true, name: "instant" };
 
@@ -61,9 +61,18 @@ function passesLiquidityCheck(ticker, opts) {
     return { ok: true, spread, bidSize, askSize };
 }
 
+// 收集当天已交易的 markets (用于 avoidSameMarketSameDay)
+function todayMarkets(state, address, today, strategyName) {
+    const markets = new Set();
+    for (const r of getDayRuns(state, address, today, strategyName)) {
+        if (r?.status === "ok" && r.symbol) markets.add(symbolToMarket(r.symbol));
+    }
+    return markets;
+}
+
 // 选 symbol: prefix UNION + underlying 过滤 + 活跃 + spread/流动性 + 多样性强制
 function selectSymbol(exchangeInfo, tickers, opts) {
-    const { prefixes, underlyings, notional, traded, minDistinct, maxSpread, minLiquidityMultiplier } = opts;
+    const { prefixes, underlyings, notional, traded, minDistinct, maxSpread, minLiquidityMultiplier, todayMs, avoidSameMarketSameDay } = opts;
     let candidates = exchangeInfo.symbols.filter(s => {
         if (s.isExpired || s.isLockedUp || s.pausedOrders) return false;
         if (parseFloat(s.minTradeNotional) > notional) return false;
@@ -93,7 +102,14 @@ function selectSymbol(exchangeInfo, tickers, opts) {
         candidates = filtered;
     }
 
-    // 多样性: 已交易市场数 < minDistinct → 优先未交易过的候选
+    // 同日去重: 今天已交易过的 market 排除 (用于 runsPerDay > 1)
+    if (avoidSameMarketSameDay && todayMs && todayMs.size > 0) {
+        const fresh = candidates.filter(s => !todayMs.has(s.market));
+        if (fresh.length > 0) candidates = fresh;
+        // else: 今日所有 market 都跑过了 (极少见, 只有 candidate < runsPerDay 时), 允许重复
+    }
+
+    // 多样性: 一周内已交易市场数 < minDistinct → 优先未交易过的候选
     const tradedCount = traded?.size ?? 0;
     if (traded && minDistinct > 0 && tradedCount < minDistinct) {
         const untraded = candidates.filter(s => !traded.has(s.market));
@@ -131,7 +147,7 @@ export async function execute(client, ctx) {
     const lookback = cfg.lookbackDays ?? 7;
     const minDistinct = cfg.minDistinctMarketsPerWeek ?? 3;
 
-    // 多样性: 看过去 N 天本钱包成功过的市场
+    // 多样性: 看过去 N 天本钱包成功过的市场 (含今天)
     const traded = tradedMarkets({
         state, address: wallet.address, today,
         lookback, boundary: dayBoundary ?? "local",
@@ -139,6 +155,12 @@ export async function execute(client, ctx) {
     });
     if (traded.size > 0) {
         log(`过去 ${lookback} 天交易过 ${traded.size}/${minDistinct} 个不同市场: [${[...traded].join(", ")}]`);
+    }
+
+    // 同日去重: 今天本钱包已交易过的 markets (runsPerDay > 1 时用)
+    const todayMs = todayMarkets(state, wallet.address, today, meta.name);
+    if (todayMs.size > 0) {
+        log(`今日已交易 ${todayMs.size} 个 market: [${[...todayMs].join(", ")}], 本次将避开`);
     }
 
     // 本次随机 notional (区间内一次决定, 整笔 open+close 用同一个值)
@@ -152,6 +174,8 @@ export async function execute(client, ctx) {
         minDistinct,
         maxSpread: cfg.maxSpread,
         minLiquidityMultiplier: cfg.minLiquidityMultiplier,
+        todayMs,
+        avoidSameMarketSameDay: cfg.avoidSameMarketSameDay ?? true,
     });
     if (!sym) {
         return { ok: false, error: `no candidate symbol (spread<=${cfg.maxSpread}, liq>=${notional}*${cfg.minLiquidityMultiplier})`, retryable: true };

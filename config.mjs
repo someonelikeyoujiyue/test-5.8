@@ -79,6 +79,11 @@ export const config = {
         // bidSize 和 askSize 都需 ≥ notional × multiplier
         // 1.0 = 刚好够; 1.5 = 留 50% 安全垫 (避免吃完 top of book)
         minLiquidityMultiplier: 1.5,
+
+        // 每钱包每天跑几笔 (默认 1, 跑命令时加 --runs=3 临时覆盖)
+        runsPerDay: 1,
+        // 同一天 N 笔之间避开同 market (满足"周内 3 个不同市场"任务)
+        avoidSameMarketSameDay: true,
     },
 
     // ---- 策略 2: 配平 (balance / wash) ----
