@@ -129,15 +129,26 @@ async function checkWallet(w, idx) {
             console.log(`  transfers: 无记录`);
         }
 
+        const fundingTotal = fa ? parseFloat(fa.totalMargin) : 0;
+        const pendingCount = tr.filter(t => t.transferStatus === "pending").length;
+        // 有 deposit 转账历史 (任何 status) 但 funding 仍为 0 + 没 pending = 疑似丢失
+        const hasDepositHistory = tr.some(t => t.transferType === "deposit");
+        const lostCandidate = fundingTotal === 0 && pendingCount === 0 && hasDepositHistory;
+
         return {
+            address: w.address,
             onchain,
             funding: fa ? { total: fa.totalMargin, withdrawable: fa.withdrawableBalance, pnl: fa.totalPnl } : null,
             openPositions: open.length,
-            pendingTransfers: tr.filter(t => t.transferStatus === "pending").length,
+            pendingTransfers: pendingCount,
+            transferCount: tr.length,
+            hasDepositHistory,
+            lostCandidate,
+            fundingZero: fundingTotal === 0,
         };
     } catch (e) {
         console.log(`  Rho API 查询失败: ${errMsg(e)}`);
-        return { onchain, error: errMsg(e) };
+        return { address: w.address, onchain, error: errMsg(e) };
     }
 }
 
@@ -181,9 +192,10 @@ async function main() {
     let totalOpenPos = 0;
     let done = 0;
     const total = wallets.length;
+    const results = new Array(wallets.length);
 
     // 并发池: N 个 worker 共享 queue
-    const queue = [...wallets];
+    const queue = wallets.map((w, i) => ({ ...w, _slot: i }));
     const workers = [];
     for (let i = 0; i < Math.min(concurrency, queue.length); i++) {
         workers.push((async () => {
@@ -191,6 +203,7 @@ async function main() {
                 const w = queue.shift();
                 if (!w) break;
                 const r = await checkWallet(w, w._origIdx);
+                results[w._slot] = { idx: w._origIdx, ...r };
                 if (r.funding?.total) totalFunding += parseFloat(r.funding.total);
                 if (r.onchain?.eth) totalEth += parseFloat(r.onchain.eth);
                 totalPending += r.pendingTransfers || 0;
@@ -205,12 +218,39 @@ async function main() {
     await Promise.all(workers);
 
     if (wallets.length > 1) {
+        // 分类
+        const lostList = results.filter(r => r?.lostCandidate);
+        const fundedList = results.filter(r => r && !r.fundingZero);
+        const pendingList = results.filter(r => r?.pendingTransfers > 0);
+        const freshList = results.filter(r => r?.fundingZero && r.pendingTransfers === 0 && !r.hasDepositHistory && !r.error);
+        const errorList = results.filter(r => r?.error);
+
         console.log(`\n${"=".repeat(70)}\n汇总:`);
-        console.log(`  钱包数: ${wallets.length}`);
-        console.log(`  链上 ETH 总和: ${totalEth.toFixed(6)}`);
-        console.log(`  funding 账户总和: ${totalFunding.toFixed(6)} USDT`);
-        console.log(`  pending transfers: ${totalPending}`);
-        console.log(`  未平仓位: ${totalOpenPos}`);
+        console.log(`  钱包数:                ${wallets.length}`);
+        console.log(`  链上 ETH 总和:         ${totalEth.toFixed(6)}`);
+        console.log(`  funding 账户总和:      ${totalFunding.toFixed(6)} USDT`);
+        console.log(`  pending transfers 总:  ${totalPending}`);
+        console.log(`  未平仓位:              ${totalOpenPos}`);
+        console.log("");
+        console.log(`  ✓ 有 funding 余额:     ${fundedList.length}`);
+        console.log(`  ⏳ 有 pending:          ${pendingList.length}`);
+        console.log(`  🆕 新钱包 (无历史):     ${freshList.length}`);
+        console.log(`  ⚠️  疑似丢失:            ${lostList.length}  (有 deposit 历史 + 无 pending + funding=0)`);
+        console.log(`  ✗ 查询失败:            ${errorList.length}`);
+
+        if (lostList.length > 0) {
+            console.log(`\n${"=".repeat(70)}`);
+            console.log(`⚠️  疑似丢失明细 (这些钱包链上 deposit 过但协议侧没 credit):`);
+            console.log("idx    address                                       transfers  funding");
+            for (const r of lostList) {
+                console.log(`  [${String(r.idx).padStart(3)}]  ${r.address}  ${String(r.transferCount).padStart(2)} 笔     ${r.funding?.total ?? "0"}`);
+            }
+            console.log(`\n建议: 把这些 address 拿去找 Rho 客服 (Discord https://discord.gg/pmCMcQV35r) 申请 reconcile`);
+        }
+
+        if (errorList.length > 0) {
+            console.log(`\n查询失败钱包 (idx): ${errorList.map(r => r.idx).join(",")}`);
+        }
     }
 }
 
