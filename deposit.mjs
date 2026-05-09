@@ -249,6 +249,8 @@ async function main() {
     const queue = wallets.map(w => ({ ...w, idx: w._origIdx }));
     let okCount = 0, failCount = 0, skipCount = 0;
     const skippedDetails = { eth_low: 0, usdt_low: 0 };
+    const failedList = [];   // {idx, address, error}
+    const skippedList = [];  // {idx, address, reason}
 
     const workers = [];
     for (let i = 0; i < Math.min(dep.concurrency, wallets.length); i++) {
@@ -261,13 +263,38 @@ async function main() {
                 else if (r.skipped) {
                     skipCount++;
                     if (r.reason && skippedDetails[r.reason] != null) skippedDetails[r.reason]++;
-                } else failCount++;
+                    skippedList.push({ idx: w.idx, address: w.address, reason: r.reason });
+                } else {
+                    failCount++;
+                    failedList.push({ idx: w.idx, address: w.address, error: r.error || "(unknown)" });
+                }
             }
         })());
     }
     await Promise.all(workers);
 
     console.log(`\n=== 完成: 成功 ${okCount} | 跳过 ${skipCount} (eth_low ${skippedDetails.eth_low}, usdt_low ${skippedDetails.usdt_low}) | 失败 ${failCount} ===`);
+
+    if (failedList.length > 0) {
+        console.log(`\n${"=".repeat(70)}`);
+        console.log(`✗ 失败钱包明细 (${failedList.length} 个, 重跑会自动重试):`);
+        failedList.sort((a, b) => a.idx - b.idx);
+        for (const f of failedList) {
+            console.log(`  [${String(f.idx).padStart(4)}] ${f.address}  ${f.error}`);
+        }
+        const idxList = failedList.map(f => f.idx).join(",");
+        console.log(`\n重跑命令: node deposit.mjs ${idxList}`);
+    }
+
+    if (skippedList.length > 0 && skippedList.length <= 30) {
+        console.log(`\n⊘ 跳过钱包明细 (${skippedList.length} 个):`);
+        skippedList.sort((a, b) => a.idx - b.idx);
+        for (const s of skippedList) {
+            console.log(`  [${String(s.idx).padStart(4)}] ${s.address}  ${s.reason}`);
+        }
+    } else if (skippedList.length > 30) {
+        console.log(`\n⊘ 跳过 ${skippedList.length} 个钱包 (太多不列, 可用 verify.mjs 看)`);
+    }
 }
 
 main().catch(e => {
