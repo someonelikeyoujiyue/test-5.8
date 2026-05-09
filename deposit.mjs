@@ -10,6 +10,16 @@ import { config } from "./config.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+// 兜底: ethers Provider 内部 polling 等异步出错若没人 catch, 默认会让 node 退出
+// 这里只 log 不退出, 让主流程把已成功的钱包计数完整保留
+process.on("unhandledRejection", (reason) => {
+    const msg = reason?.message || String(reason);
+    console.warn(`[unhandledRejection 已忽略] ${msg.slice(0, 200)}`);
+});
+process.on("uncaughtException", (e) => {
+    console.warn(`[uncaughtException 已忽略] ${e?.message?.slice(0, 200) || e}`);
+});
+
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const ts = () => new Date().toISOString().slice(11, 19);
 const errMsg = e => e?.shortMessage || e?.info?.error?.message || e?.message || String(e);
@@ -297,7 +307,7 @@ async function main() {
     }
 }
 
-main().catch(e => {
-    console.error("fatal:", e);
-    process.exit(1);
-});
+main().then(
+    () => process.exit(0),     // 显式 exit, 不让 ethers Provider 继续 poll 后崩
+    e => { console.error("fatal:", e); process.exit(1); }
+);

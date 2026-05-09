@@ -12,6 +12,16 @@ import { config } from "./config.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+// daemon 长跑时, ethers Provider 内部 polling 偶发抛错若没人 catch 默认会让 node 退出
+// 这里只 log 不退出, 让 daemon 继续工作
+process.on("unhandledRejection", (reason) => {
+    const msg = reason?.message || String(reason);
+    console.warn(`[unhandledRejection 已忽略] ${msg.slice(0, 200)}`);
+});
+process.on("uncaughtException", (e) => {
+    console.warn(`[uncaughtException 已忽略] ${e?.message?.slice(0, 200) || e}`);
+});
+
 const ts = () => new Date().toISOString().slice(11, 19);
 const fmtTime = d => d.toISOString().replace("T", " ").slice(0, 19) + " UTC";
 const errMsg = e => e?.response ? `${e.response.status} ${JSON.stringify(e.response.data).slice(0, 300)}` : e?.message;
