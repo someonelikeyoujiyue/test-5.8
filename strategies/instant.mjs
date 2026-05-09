@@ -30,14 +30,15 @@ function pastDayKeys(today, lookback, boundary) {
 }
 
 // 该钱包过去 lookback 天里 status=ok 的所有不同 market
+// (适配 v2 array 格式, 兼容 v1 single-record)
 function tradedMarkets({ state, address, today, lookback, boundary, strategyName }) {
     if (!state || !address || !today) return new Set();
     const markets = new Set();
-    const runs = state[address.toLowerCase()]?.runs ?? {};
     for (const day of pastDayKeys(today, lookback, boundary)) {
-        const r = runs[day]?.[strategyName];
-        if (r?.status === "ok" && r.symbol) {
-            markets.add(symbolToMarket(r.symbol));
+        for (const r of getDayRuns(state, address, day, strategyName)) {
+            if (r?.status === "ok" && r.symbol) {
+                markets.add(symbolToMarket(r.symbol));
+            }
         }
     }
     return markets;
