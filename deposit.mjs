@@ -53,10 +53,13 @@ async function processWallet(rho, swap, wallet, idx, amountCap) {
     const log = msg => console.log(`[${ts()}] ${tag} ${msg}`);
 
     // Phase 0: 先激活 Rho user (跑前端登录流程, indexer 才会认领后续 deposit)
+    // !! 失败必须 return, 否则 swap+deposit 链上 OK 但协议侧不 credit, 资金永久丢失
+    // (参考 wallet 2 第一笔 25.86 USDT 案例)
     try {
         await activateRhoUser(wallet, log);
     } catch (e) {
-        log(`Rho 激活失败: ${errMsg(e)} (继续, 但 deposit 可能不到账)`);
+        log(`✗ Rho 激活失败: ${errMsg(e)} - 跳过此钱包 (防止 deposit 进 vault 但协议不 credit)`);
+        return { ok: false, error: `activate: ${errMsg(e)}`, retryable: true };
     }
 
     let pf;
