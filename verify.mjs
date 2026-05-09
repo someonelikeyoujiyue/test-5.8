@@ -141,13 +141,29 @@ async function checkWallet(w, idx) {
     }
 }
 
+// CLI flag: --concurrency=N (默认 10)
+function parseConcurrency(args) {
+    for (const a of args) {
+        const m = a.match(/^--(?:concurrency|c)=(\d+)$/);
+        if (m) {
+            const n = parseInt(m[1]);
+            if (n > 0 && n <= 200) return n;
+        }
+    }
+    return 10;
+}
+
 async function main() {
     const password = await askPassword("请输入解密密码: ");
     let wallets;
     try { wallets = loadWallets(__dirname, password); }
     catch (e) { console.log("解密失败:", e.message); process.exit(1); }
 
-    const selected = parseSelectors(process.argv.slice(2), wallets.length);
+    const cliArgs = process.argv.slice(2);
+    const concurrency = parseConcurrency(cliArgs);
+    // selector 解析时跳过 -- flag
+    const selectorTokens = cliArgs.filter(a => !a.startsWith("--"));
+    const selected = parseSelectors(selectorTokens, wallets.length);
     if (selected) {
         wallets = selected.map(i => ({ ...wallets[i - 1], _origIdx: i }));
     } else {
@@ -155,7 +171,7 @@ async function main() {
     }
 
     console.log(`=== 钱包状态检查 ===`);
-    console.log(`选中: ${wallets.length} 个钱包${selected ? ` (${selected.join(",")})` : " (全部)"}`);
+    console.log(`选中: ${wallets.length} 个钱包${selected ? ` (${selected.join(",")})` : " (全部)"} | 并发: ${concurrency}`);
     console.log(`gateway: ${config.deposit.gateway}`);
     console.log(`apiBase: ${config.apiBase}`);
 
@@ -163,14 +179,30 @@ async function main() {
     let totalEth = 0;
     let totalPending = 0;
     let totalOpenPos = 0;
+    let done = 0;
+    const total = wallets.length;
 
-    for (const w of wallets) {
-        const r = await checkWallet(w, w._origIdx);
-        if (r.funding?.total) totalFunding += parseFloat(r.funding.total);
-        if (r.onchain?.eth) totalEth += parseFloat(r.onchain.eth);
-        totalPending += r.pendingTransfers || 0;
-        totalOpenPos += r.openPositions || 0;
+    // 并发池: N 个 worker 共享 queue
+    const queue = [...wallets];
+    const workers = [];
+    for (let i = 0; i < Math.min(concurrency, queue.length); i++) {
+        workers.push((async () => {
+            while (queue.length) {
+                const w = queue.shift();
+                if (!w) break;
+                const r = await checkWallet(w, w._origIdx);
+                if (r.funding?.total) totalFunding += parseFloat(r.funding.total);
+                if (r.onchain?.eth) totalEth += parseFloat(r.onchain.eth);
+                totalPending += r.pendingTransfers || 0;
+                totalOpenPos += r.openPositions || 0;
+                done++;
+                if (total > 50 && done % 50 === 0) {
+                    console.log(`\n[进度] ${done}/${total}\n`);
+                }
+            }
+        })());
     }
+    await Promise.all(workers);
 
     if (wallets.length > 1) {
         console.log(`\n${"=".repeat(70)}\n汇总:`);
