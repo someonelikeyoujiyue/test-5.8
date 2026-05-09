@@ -55,7 +55,7 @@ export const config = {
         // 单笔名义额 (USDT, 直接 = 下单 quantity)
         // 区间随机: [min, max] 整数 USDT; 单值用 [N, N] 写
         // symbol 的 minTradeNotional 通常 100, 下限不能低于 100
-        notionalUsdRange: [100, 1000],
+        notionalUsdRange: [100, 101],
 
         // 方向: random | long | short
         side: "random",
