@@ -144,6 +144,29 @@ async function runStrategy({ strategy, stratName, wallets, exchangeInfo, tickers
     } else {
         // perWallet 策略 (instant) 支持每钱包跑到 target 次
         // 工作池: 每个 worker 完整跑完一个钱包的所有 remaining 笔, 再拿下一个
+
+        // tickers 周期刷新: 每 N 个 run 后台 fetch 一次, 原地 mutate 所有 worker 共享的 map
+        // 避免 1000 钱包用同一份过期快照, 早期触发的过滤跟实时盘口对不上
+        const refreshEvery = config[stratName]?.tickersRefreshEvery ?? 50;
+        let refreshing = false;
+        const refreshTickersAsync = () => {
+            if (refreshing) return;
+            refreshing = true;
+            (async () => {
+                try {
+                    const fresh = await fetchAllTickersMap(config.apiBase);
+                    // 原地 mutate, 让 worker 持有的引用直接看到新数据
+                    for (const k of Object.keys(tickers)) delete tickers[k];
+                    Object.assign(tickers, fresh);
+                    console.log(`[${ts()}] 🔄 tickers 已刷新 (${Object.keys(tickers).length} 个 symbol)`);
+                } catch (e) {
+                    console.warn(`[${ts()}] tickers 刷新失败: ${errMsg(e)}`);
+                } finally {
+                    refreshing = false;
+                }
+            })();
+        };
+
         const tasks = [...candidates];
         const workers = [];
         let ok = 0, fail = 0, doneRuns = 0;
@@ -168,7 +191,13 @@ async function runStrategy({ strategy, stratName, wallets, exchangeInfo, tickers
                         saveState(stateFile, state);
                         if (r.ok) ok++; else fail++;
                         doneRuns++;
-                        if (doneRuns % 50 === 0) console.log(`[${ts()}] 进度 ${doneRuns} runs (ok=${ok} fail=${fail})`);
+                        if (doneRuns % 50 === 0) {
+                            console.log(`[${ts()}] 进度 ${doneRuns} runs (ok=${ok} fail=${fail})`);
+                        }
+                        // 周期刷新 tickers (异步, 不阻塞 worker)
+                        if (doneRuns % refreshEvery === 0) {
+                            refreshTickersAsync();
+                        }
                     }
                 }
             })());

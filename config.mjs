@@ -91,6 +91,11 @@ export const config = {
         runsPerDay: 1,
         // 同一天 N 笔之间避开同 market (满足"周内 3 个不同市场"任务)
         avoidSameMarketSameDay: true,
+
+        // tickers 刷新频率: 每跑 N 个 run 后异步刷新一次实时盘口
+        // 避免 1000 钱包共用 cycle 开始时的快照, 后期 worker 用过期 spread/depth
+        // 设 0 = 关闭周期刷新 (只在 cycle 开始拉一次)
+        tickersRefreshEvery: 50,
     },
 
     // ---- 策略 2: 配平 (balance / wash) ----
