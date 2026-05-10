@@ -56,7 +56,8 @@ export const config = {
         // 单笔名义额 (USDT, 直接 = 下单 quantity)
         // 区间随机: [min, max] 整数 USDT; 单值用 [N, N] 写
         // symbol 的 minTradeNotional 通常 100, 下限不能低于 100
-        notionalUsdRange: [100, 101],
+        // 项目方新规: 单笔交易量 2000 (开 1000 + 关 1000) → 单边 notional 1000
+        notionalUsdRange: [1000, 1001],
 
         // 方向: random | long | short
         side: "random",
@@ -72,10 +73,10 @@ export const config = {
         // 单 pass 内 IOC 单不补单成交, 等 300ms 让 LP 补单后再下一 pass
         maxClosePasses: 3,
 
-        // 多样性约束: 一周内每钱包至少交易 N 个不同 market (项目方任务要求 = 3)
+        // 多样性约束: 一周内每钱包至少交易 N 个不同 market (项目方新规 2026-05-10 = 5)
         // 当 lookback 内已交易 market 数 < minDistinctMarketsPerWeek,
         // 强制从未交易过的候选池挑选; 满足后回归纯随机
-        minDistinctMarketsPerWeek: 3,
+        minDistinctMarketsPerWeek: 5,
         lookbackDays: 7,
 
         // 秒开秒关 spread + 流动性约束 (避免吃多档滑点)
@@ -83,7 +84,8 @@ export const config = {
         maxSpread: 0.01,
         // bidSize 和 askSize 都需 ≥ notional × multiplier
         // 1.0 = 刚好够; 1.5 = 留 50% 安全垫 (避免吃完 top of book)
-        minLiquidityMultiplier: 1.5,
+        // vol=1000 时 BINANCE-BTC 的 ask 经常 < 1500, 用 1.0 + 后置反向同量平仓的重试机制兜底
+        minLiquidityMultiplier: 1.0,
 
         // 每钱包每天跑几笔 (默认 1, 跑命令时加 --runs=3 临时覆盖)
         runsPerDay: 1,

@@ -14,8 +14,10 @@ export const meta = { type: "perWallet", perDay: true, name: "instant" };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const pick = arr => arr[Math.floor(Math.random() * arr.length)];
 
-// 从 symbol 提取 market id (去掉 :MATURITY 后缀, 同市场不同到期视为同一个)
-const symbolToMarket = s => s?.split(":")[0] ?? s;
+// distinct key: 默认按 full symbol 含 maturity (RHO-BTC:29MAY 和 RHO-BTC:26JUN 算两个)
+// 项目方任务"5 个不同市场"按前端 12 个 symbol 显示算
+// 如果以后改回按 market (无 maturity, 6 个), 把 ?? s 那行改成 s.split(":")[0] ?? s
+const symbolToMarket = s => s ?? s;
 
 // 列出过去 N 天 today 倒推的 dayKey 列表
 function pastDayKeys(today, lookback, boundary) {
@@ -105,15 +107,15 @@ function selectSymbol(exchangeInfo, tickers, opts) {
 
     // 同日去重: 今天已交易过的 market 排除 (用于 runsPerDay > 1)
     if (avoidSameMarketSameDay && todayMs && todayMs.size > 0) {
-        const fresh = candidates.filter(s => !todayMs.has(s.market));
+        const fresh = candidates.filter(s => !todayMs.has(s.symbol));
         if (fresh.length > 0) candidates = fresh;
-        // else: 今日所有 market 都跑过了 (极少见, 只有 candidate < runsPerDay 时), 允许重复
+        // else: 今日所有 symbol 都跑过了, 允许重复
     }
 
-    // 多样性: 一周内已交易市场数 < minDistinct → 优先未交易过的候选
+    // 多样性: 一周内已交易 symbol 数 < minDistinct → 优先未交易过的候选
     const tradedCount = traded?.size ?? 0;
     if (traded && minDistinct > 0 && tradedCount < minDistinct) {
-        const untraded = candidates.filter(s => !traded.has(s.market));
+        const untraded = candidates.filter(s => !traded.has(s.symbol));
         if (untraded.length > 0) candidates = untraded;
     }
 
