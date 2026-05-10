@@ -14,10 +14,10 @@ export const meta = { type: "perWallet", perDay: true, name: "instant" };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const pick = arr => arr[Math.floor(Math.random() * arr.length)];
 
-// distinct key: 默认按 full symbol 含 maturity (RHO-BTC:29MAY 和 RHO-BTC:26JUN 算两个)
-// 项目方任务"5 个不同市场"按前端 12 个 symbol 显示算
-// 如果以后改回按 market (无 maturity, 6 个), 把 ?? s 那行改成 s.split(":")[0] ?? s
-const symbolToMarket = s => s ?? s;
+// distinct key: 按 market 名 (不含 maturity), 跟项目方 market_explorer.qualifying_markets 一致
+// 项目方算法: RHO-BTCUSDT:29MAY26 和 RHO-BTCUSDT:26JUN26 算同一个 market (RHO-BTCUSDT)
+// 不能改成 full symbol, 否则策略会在同一 market 的不同 maturity 间转, distinct 虚高但项目方只算 1 个
+const symbolToMarket = s => s ? s.split(":")[0] : s;
 
 // 列出过去 N 天 today 倒推的 dayKey 列表
 function pastDayKeys(today, lookback, boundary) {
@@ -106,16 +106,17 @@ function selectSymbol(exchangeInfo, tickers, opts) {
     }
 
     // 同日去重: 今天已交易过的 market 排除 (用于 runsPerDay > 1)
+    // todayMs 装的是 market 名 (不含 maturity), candidate 用 symbolToMarket 转换匹配
     if (avoidSameMarketSameDay && todayMs && todayMs.size > 0) {
-        const fresh = candidates.filter(s => !todayMs.has(s.symbol));
+        const fresh = candidates.filter(s => !todayMs.has(symbolToMarket(s.symbol)));
         if (fresh.length > 0) candidates = fresh;
-        // else: 今日所有 symbol 都跑过了, 允许重复
+        // else: 今日所有 market 都跑过了, 允许重复 maturity
     }
 
-    // 多样性: 一周内已交易 symbol 数 < minDistinct → 优先未交易过的候选
+    // 多样性: 一周内已交易 market 数 < minDistinct → 优先未交易过的 market
     const tradedCount = traded?.size ?? 0;
     if (traded && minDistinct > 0 && tradedCount < minDistinct) {
-        const untraded = candidates.filter(s => !traded.has(s.symbol));
+        const untraded = candidates.filter(s => !traded.has(symbolToMarket(s.symbol)));
         if (untraded.length > 0) candidates = untraded;
     }
 
@@ -226,14 +227,23 @@ export async function execute(client, ctx) {
     //    若 close 部分成交, 重试最多 maxClosePasses 次直到 totalClosed >= openVol.
     const closeSide = side === "buy" ? "sell" : "buy";
     const maxPasses = cfg.maxClosePasses ?? 3;
+    const minNotional = parseFloat(sym.minTradeNotional) || 100;
     let totalClosed = 0;
     let lastClose = null;
     let totalCloseFee = 0;
     const closeFills = [];
 
     for (let pass = 1; pass <= maxPasses; pass++) {
-        const remaining = openVol - totalClosed;
-        if (remaining <= 0.01) break;   // 已经平完 (留 0.01 容差应付浮点)
+        const remainingRaw = openVol - totalClosed;
+        if (remainingRaw <= 0.01) break;   // 已经平完 (留 0.01 容差应付浮点)
+        // 浮点减法会引入精度误差 (76.04 - 23.96 = 52.07999999999999), 服务端要求 6 位精度.
+        // 向下截断到 6 位, 避免传 "76.03999999999996" 被拒.
+        const remaining = Math.floor(remainingRaw * 1e6) / 1e6;
+        if (remaining < minNotional) {
+            // 残量低于 minTradeNotional, 再发单也是 400; 留给 cleanupOnStart 下次扫
+            log(`  close pass${pass}: 残量 ${remaining.toFixed(4)} < minNotional ${minNotional}, 放弃重试`);
+            break;
+        }
         const closeCid = (cidBase + "c" + (pass > 1 ? pass : "")).slice(0, 36);
         let resp;
         try {
@@ -241,7 +251,7 @@ export async function execute(client, ctx) {
                 orderType: "market",
                 symbol: sym.symbol,
                 side: closeSide,
-                quantity: String(remaining),
+                quantity: remaining.toFixed(6),
                 timeInForce: "IOC",
                 clientOrderId: closeCid,
             });

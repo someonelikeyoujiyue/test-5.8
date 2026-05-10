@@ -46,9 +46,8 @@ export const config = {
     instant: {
         // 候选 prefix (UNION 模式, 任一前缀命中即纳入候选池)
         // 排除 ASTER (流动性薄, 单笔吃多档导致磨损 -$1+/笔)
-        // 排除 BYBIT (同样发现磨损偏高)
-        // 保留 RHO/BINANCE/OKX × {BTC,ETH} = 6 个 market, 仍 > minDistinctMarketsPerWeek=3
-        symbolPrefixes: ["RHO-", "BINANCE-", "OKX-"],
+        // BYBIT 加回: 单池深度也够, 由下面 minLiquidityMultiplier=2.0 兜底过滤
+        symbolPrefixes: ["RHO-", "BINANCE-", "OKX-", "BYBIT-"],
 
         // 接受的标的资产
         underlyings: ["BTC", "ETH"],
@@ -83,9 +82,10 @@ export const config = {
         // spread 单位是利率 (rate), 0.01 = 1% 价差
         maxSpread: 0.01,
         // bidSize 和 askSize 都需 ≥ notional × multiplier
-        // 1.0 = 刚好够; 1.5 = 留 50% 安全垫 (避免吃完 top of book)
-        // vol=1000 时 BINANCE-BTC 的 ask 经常 < 1500, 用 1.0 + 后置反向同量平仓的重试机制兜底
-        minLiquidityMultiplier: 1.0,
+        // mult=2.0: 开 1000 后那侧仍剩 ≥ 1000 给反向 IOC 平仓
+        //   - 1.0 见过 LP 在开仓 200ms gap 内重新铺不出深度 → 平仓 IOC 部分成交残留
+        //   - 2.0 把残留率压到接近 0; 残留靠 cleanup.mjs 人工扫
+        minLiquidityMultiplier: 2.0,
 
         // 每钱包每天跑几笔 (默认 1, 跑命令时加 --runs=3 临时覆盖)
         runsPerDay: 1,
