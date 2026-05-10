@@ -55,8 +55,9 @@ export const config = {
         // 单笔名义额 (USDT, 直接 = 下单 quantity)
         // 区间随机: [min, max] 整数 USDT; 单值用 [N, N] 写
         // symbol 的 minTradeNotional 通常 100, 下限不能低于 100
-        // 项目方新规: 单笔交易量 2000 (开 1000 + 关 1000) → 单边 notional 1000
-        notionalUsdRange: [1000, 1001],
+        // 项目方新规: 单边 notional ≥ 1000 (开 + 关 = 双边 vol ≥ 2000 满足 daily_trader)
+        // [1005, 1010] 加 5-10 的随机化, 避免 1000 整数被聚类识别
+        notionalUsdRange: [1005, 1010],
 
         // 方向: random | long | short
         side: "random",
