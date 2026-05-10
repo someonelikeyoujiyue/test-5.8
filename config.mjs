@@ -13,7 +13,7 @@ export const config = {
     cleanupOnStart: true,
 
     // 钱包并发
-    concurrency: 10,
+    concurrency: 20,
 
     // 失败钱包是否重试 (重跑脚本时, 失败记录默认会重试; ok 会跳过)
     retryFailed: true,
