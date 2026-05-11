@@ -62,15 +62,33 @@ export const config = {
         // 方向: random | long | short
         side: "random",
 
-        // 开/平之间的间隔 (毫秒); 0 表示立即
+        // ---- 智能开关仓 (替代旧"秒开秒关单 IOC") ----
+        // 持仓时长 [min, max] 毫秒随机. 给 LP 补单时间, 也让 close 盘口更深.
+        // [500, 2000] = 半秒到 2 秒持仓; 改 [3000, 8000] 就是几秒级
+        holdMsRange: [500, 2000],
+
+        // 开仓: 多次 IOC 凑齐 notional (单 IOC partial fill 时继续补)
+        // 累计成交 ≥ notional × openMinFillRatio 算成功; 否则反向平回 + fail
+        // openMaxAttempts = 5 时最长用时 ≈ 5 × retryGapMs + 5 × API 延迟
+        openMaxAttempts: 5,
+        openMinFillRatio: 0.99,
+
+        // 平仓: 多次 IOC 凑齐 openVol; 残量 < minNotional 时用 close-position 兜底
+        // (close-position flag 服务端绕开 minNotional, 额外 1 笔 fee 但能彻底平干净)
+        closeMaxAttempts: 5,
+        closePositionFallback: true,
+
+        // 每次 IOC 之间等多久 (毫秒) 让 LP 补单
+        retryGapMs: 500,
+
+        // 旧字段 (向后兼容, 没设 holdMsRange 时回退到 gapMs 单值)
         gapMs: 200,
 
         // 平仓后是否查 positions 校验归零 (新版默认靠 vol 比对, 不再额外查 API)
         verifyClose: true,
         verifyDelayMs: 1500,
 
-        // 平仓 partial fill 时最多重试几 pass (确保 open vol == close vol)
-        // 单 pass 内 IOC 单不补单成交, 等 300ms 让 LP 补单后再下一 pass
+        // 已被 closeMaxAttempts 取代, 保留无害 (兼容旧 config)
         maxClosePasses: 3,
 
         // 多样性约束: 一周内每钱包至少交易 N 个不同 market (项目方新规 2026-05-10 = 5)
