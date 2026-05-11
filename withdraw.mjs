@@ -91,9 +91,9 @@ async function rhoLogin(http, w) {
 }
 
 async function fetchDepositaryId(http) {
-    const ei = (await http.get("/api/v1/exchange-info")).data;
+    const ei = (await http.get("/api/v1/exchange/info")).data;
     const dep = ei.depositaries?.find(d => d.blockchainId === CHAIN_ID);
-    if (!dep) throw new Error(`exchange-info 没找到 ${CHAIN_ID} depositary`);
+    if (!dep) throw new Error(`exchange/info 没找到 ${CHAIN_ID} depositary`);
     return dep.depositaryId;
 }
 
