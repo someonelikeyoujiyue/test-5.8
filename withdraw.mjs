@@ -29,6 +29,7 @@
 //   node withdraw.mjs --dry-run             只构造 + 打印, 不真提交
 //   node withdraw.mjs --min=5               funding maxNet < 5 USDT 跳过
 //   node withdraw.mjs --yes                 跳过确认
+//   node withdraw.mjs --status 1-100        只查提现状态 (pending / confirmed), 不发起新提现
 //
 // 安全:
 //   - dryRun 时不发 POST, 不签名也能跑通逻辑 (打印将要构造的 hash)
@@ -211,6 +212,65 @@ async function processWallet(w, idx, opts) {
     }
 }
 
+// --status 模式: 登录钱包, 查 transfers, 列出所有 withdrawal 状态
+async function checkWithdrawStatus(w, idx) {
+    const tag = `[${String(idx).padStart(4)}] ${w.address.slice(0, 10)}`;
+    const log = m => console.log(`[${ts()}] ${tag} ${m}`);
+
+    const wallet = new Wallet(w.privateKey);
+    const http = makeAxios(w.proxy);
+    let auth;
+    try {
+        auth = await rhoLogin(http, w);
+    } catch (e) {
+        log(`login 失败: ${errMsg(e)}`);
+        return { idx, address: w.address, ok: false, error: `login: ${errMsg(e)}` };
+    }
+
+    let transfers, funding;
+    try {
+        const [trRes, maRes] = await Promise.all([
+            http.get("/api/v1/users/transfers", { headers: auth.headers }),
+            http.get("/api/v1/margin-accounts", { headers: auth.headers }),
+        ]);
+        transfers = trRes.data.updates ?? [];
+        funding = maRes.data.userMarginAccounts?.find(a => a.marginAccount === MARGIN_ACCOUNT);
+    } catch (e) {
+        log(`查 transfers 失败: ${errMsg(e)}`);
+        return { idx, address: w.address, ok: false, error: errMsg(e) };
+    }
+
+    const withdrawals = transfers.filter(t => t.transferType === "withdrawal");
+    const pending = withdrawals.filter(t => t.transferStatus === "pending");
+    const confirmed = withdrawals.filter(t => t.transferStatus === "confirmed");
+    const settled = withdrawals.filter(t => t.transferStatus === "settled" || t.transferStatus === "completed");
+
+    if (withdrawals.length === 0) {
+        log(`funding=${funding?.totalMargin ?? "?"}  无提现历史`);
+    } else {
+        // 显示最近 1 笔状态
+        const last = withdrawals[0];   // updates 是 desc 顺序
+        const flag = last.transferStatus === "pending" ? "⏳" : (last.transferStatus === "confirmed" || last.transferStatus === "settled" || last.transferStatus === "completed") ? "✓" : "?";
+        const dest = last.chainAddress?.toLowerCase() === w.address.toLowerCase() ? "self" : `❗别人 ${last.chainAddress}`;
+        const tx = last.chainTxHash?.slice(0, 14) ?? "(api/pending)";
+        log(`funding=${funding?.totalMargin ?? "?"}  ${flag} ${last.delta} USDT  status=${last.transferStatus}  → ${dest}  tx=${tx}  withdrawalsTotal=${withdrawals.length}(pending=${pending.length} confirmed=${confirmed.length} settled=${settled.length})`);
+    }
+
+    return {
+        idx, address: w.address, ok: true,
+        funding: funding?.totalMargin,
+        withdrawals: withdrawals.map(t => ({
+            status: t.transferStatus,
+            delta: t.delta,
+            chainAddress: t.chainAddress,
+            chainTxHash: t.chainTxHash,
+            time: t.time,
+            deadline: t.deadline,
+        })),
+        counts: { pending: pending.length, confirmed: confirmed.length, settled: settled.length, total: withdrawals.length },
+    };
+}
+
 function parseSelectors(args, max) {
     const tokens = args.filter(a => !a.startsWith("--"))
         .flatMap(a => String(a).split(/\s+/)).filter(Boolean);
@@ -246,6 +306,7 @@ async function confirm(msg) {
 
 async function main() {
     const args = process.argv.slice(2);
+    const statusOnly = args.includes("--status");
     const dryRun = args.includes("--dry-run");
     const skipConfirm = args.includes("--yes");
     const concurrency = parseInt(parseFlag(args, "concurrency", "c") || "5");
@@ -263,14 +324,19 @@ async function main() {
     if (selected) wallets = selected.map(i => ({ ...wallets[i - 1], _origIdx: i }));
     else wallets = wallets.map((w, i) => ({ ...w, _origIdx: i + 1 }));
 
-    console.log(`=== Rho funding 提现 ${dryRun ? "(DRY-RUN)" : "实盘"} ===`);
-    console.log(`钱包: ${wallets.length}${selected ? ` (${selected.slice(0, 20).join(",")}${selected.length > 20 ? "..." : ""})` : " (全部)"} | 并发: ${concurrency}`);
-    if (minAmount > 0) console.log(`跳过 maxNet < ${minAmount} USDT 的钱包`);
-    console.log(`手续费固定 1 USDT/笔, 全提 maxNetWithdrawAmount\n`);
+    if (statusOnly) {
+        console.log(`=== Rho funding 提现状态查询 ===`);
+        console.log(`钱包: ${wallets.length}${selected ? ` (${selected.slice(0, 20).join(",")}${selected.length > 20 ? "..." : ""})` : " (全部)"} | 并发: ${concurrency}\n`);
+    } else {
+        console.log(`=== Rho funding 提现 ${dryRun ? "(DRY-RUN)" : "实盘"} ===`);
+        console.log(`钱包: ${wallets.length}${selected ? ` (${selected.slice(0, 20).join(",")}${selected.length > 20 ? "..." : ""})` : " (全部)"} | 并发: ${concurrency}`);
+        if (minAmount > 0) console.log(`跳过 maxNet < ${minAmount} USDT 的钱包`);
+        console.log(`手续费固定 1 USDT/笔, 全提 maxNetWithdrawAmount\n`);
 
-    if (!dryRun && !skipConfirm) {
-        const ok = await confirm(`将对 ${wallets.length} 钱包发起提现, 确认? (yes/no) `);
-        if (!ok) { console.log("取消"); return; }
+        if (!dryRun && !skipConfirm) {
+            const ok = await confirm(`将对 ${wallets.length} 钱包发起提现, 确认? (yes/no) `);
+            if (!ok) { console.log("取消"); return; }
+        }
     }
 
     const t0 = Date.now();
@@ -283,7 +349,9 @@ async function main() {
             while (queue.length) {
                 const w = queue.shift();
                 if (!w) break;
-                const r = await processWallet(w, w._origIdx, { dryRun, minAmount });
+                const r = statusOnly
+                    ? await checkWithdrawStatus(w, w._origIdx)
+                    : await processWallet(w, w._origIdx, { dryRun, minAmount });
                 results[w._origIdx - 1] = r;
                 done++;
                 if (done % 50 === 0) {
@@ -298,10 +366,47 @@ async function main() {
     const all = results.filter(Boolean);
     const ok = all.filter(r => r.ok);
     const failed = all.filter(r => !r.ok);
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(0);
+
+    if (statusOnly) {
+        // 汇总: 按 status 聚合
+        let pendingW = 0, confirmedW = 0, settledW = 0, totalPendingAmt = 0, walletsHavePending = 0, walletsNoHistory = 0, otherAddr = 0;
+        for (const r of ok) {
+            const c = r.counts || {};
+            pendingW += c.pending || 0;
+            confirmedW += c.confirmed || 0;
+            settledW += c.settled || 0;
+            if ((c.total || 0) === 0) walletsNoHistory++;
+            else if ((c.pending || 0) > 0) walletsHavePending++;
+            for (const w of r.withdrawals || []) {
+                if (w.status === "pending") totalPendingAmt += Math.abs(parseFloat(w.delta) || 0);
+                if (w.chainAddress && w.chainAddress.toLowerCase() !== r.address.toLowerCase()) otherAddr++;
+            }
+        }
+        console.log(`\n${"=".repeat(70)}`);
+        console.log(`=== 完成 (${elapsed}s) ===`);
+        console.log(`钱包总数:           ${all.length}`);
+        console.log(`查询成功:           ${ok.length}`);
+        console.log(`查询失败:           ${failed.length}`);
+        console.log("");
+        console.log(`⏳ pending 钱包数:   ${walletsHavePending}`);
+        console.log(`📭 无提现历史:       ${walletsNoHistory}`);
+        console.log(`⏳ pending 笔数:     ${pendingW}  合计 ${totalPendingAmt.toFixed(2)} USDT 在排队`);
+        console.log(`✓ confirmed 笔数:   ${confirmedW}`);
+        console.log(`✓ settled 笔数:     ${settledW}`);
+        if (otherAddr > 0) console.log(`❗ 目的地 ≠ 自己:    ${otherAddr}  ←⚠️ 异常, 检查`);
+        if (failed.length > 0) {
+            console.log(`\n失败钱包重查: node withdraw.mjs --status ${failed.map(f => f.idx).join(" ")}`);
+            for (const f of failed.sort((a, b) => a.idx - b.idx)) {
+                console.log(`  [${String(f.idx).padStart(4)}] ${f.address}  ${f.error}`);
+            }
+        }
+        return;
+    }
+
     const submitted = ok.filter(r => !r.skipped && !r.dry);
     const skipped = ok.filter(r => r.skipped);
     const dry = ok.filter(r => r.dry);
-    const elapsed = ((Date.now() - t0) / 1000).toFixed(0);
     const totalAmount = submitted.reduce((s, r) => s + parseFloat(r.amount || 0), 0);
 
     console.log(`\n${"=".repeat(60)}`);
