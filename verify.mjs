@@ -247,11 +247,20 @@ async function main() {
         const freshList = results.filter(r => r?.fundingZero && r.pendingTransfers === 0 && !r.hasDepositHistory && !r.error);
         const errorList = results.filter(r => r?.error);
 
+        // onchain 分类: 哪些钱包没 ETH/USDT (0 余额); allowance 是否 MAX (deposit 准备状态)
+        const noEthList   = mode !== "rho" ? results.filter(r => r?.onchain && parseFloat(r.onchain.eth || 0) === 0) : [];
+        const noUsdtList  = mode !== "rho" ? results.filter(r => r?.onchain && parseFloat(r.onchain.usdt || 0) === 0) : [];
+        const noApproveList = mode !== "rho" ? results.filter(r => r?.onchain && r.onchain.allowance !== "MAX") : [];
+
         console.log(`\n${"=".repeat(70)}\n汇总 (mode=${mode}):`);
         console.log(`  钱包数:                ${wallets.length}`);
         if (mode !== "rho") {
             console.log(`  链上 ETH 总和:         ${totalEth.toFixed(6)}`);
             console.log(`  链上 USDT 总和:        ${totalUsdt.toFixed(6)}`);
+            console.log("");
+            console.log(`  ⚠️  无 ETH (=0):         ${noEthList.length}`);
+            console.log(`  ⚠️  无 USDT (=0):        ${noUsdtList.length}`);
+            console.log(`  ⚠️  allowance ≠ MAX:    ${noApproveList.length}  (deposit 前需 approve)`);
         }
         if (mode !== "onchain") {
             console.log(`  funding 账户总和:      ${totalFunding.toFixed(6)} USDT`);
@@ -274,6 +283,19 @@ async function main() {
             }
             console.log(`\n建议: 把这些 address 拿去找 Rho 客服 (Discord https://discord.gg/pmCMcQV35r) 申请 reconcile`);
         }
+
+        // onchain 资金问题明细 (truncate 到 30 个; 超出只打 idx 列表)
+        function printOnchainList(label, list, valueKey, unit) {
+            if (list.length === 0) return;
+            console.log(`\n${label} (${list.length} 个):`);
+            const show = list.slice(0, 30);
+            for (const r of show) {
+                console.log(`  [${String(r.idx).padStart(4)}] ${r.address}  ${valueKey}=${r.onchain?.[valueKey]} ${unit}`);
+            }
+            if (list.length > 30) console.log(`  ... 还有 ${list.length - 30} 个, idx: ${list.slice(30).map(r => r.idx).join(",")}`);
+        }
+        printOnchainList(`🔴 无 ETH 钱包`, noEthList, "eth", "ETH");
+        printOnchainList(`🔴 无 USDT 钱包`, noUsdtList, "usdt", "USDT");
 
         if (errorList.length > 0) {
             console.log(`\n查询失败钱包 (idx): ${errorList.map(r => r.idx).join(",")}`);
