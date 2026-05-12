@@ -78,34 +78,49 @@ async function checkWallet(w, idx, mode = "all") {
 
     // ---- 链上 (mode=all|onchain) ----
     let onchain = null;
+    let onchainError = null;
     if (mode === "all" || mode === "onchain") {
         onchain = { eth: "?", usdt: "?", allowance: "?", nonce: "?" };
-        try {
-            const rpcProxy = (config.deposit.rpcUseProxy ?? false) ? w.proxy : null;
-            const provider = buildProvider(config.deposit.ethRpcUrls ?? config.deposit.ethRpcUrl, rpcProxy, w.address);
-            const usdt = new Contract(config.deposit.usdt, ERC20_ABI, provider);
-            const [eth, ub, alw, nonce, decimals] = await Promise.all([
-                provider.getBalance(w.address),
-                usdt.balanceOf(w.address),
-                usdt.allowance(w.address, config.deposit.gateway),
-                provider.getTransactionCount(w.address),
-                usdt.decimals(),
-            ]);
-            onchain = {
-                eth: formatEther(eth),
-                usdt: formatUnits(ub, decimals),
-                allowance: alw >= 2n ** 200n ? "MAX" : formatUnits(alw, decimals),
-                nonce,
-            };
-        } catch (e) {
-            console.log(`  链上查询失败: ${errMsg(e)}`);
+        // 3 次重试 (Infura -32005 Too Many Requests / 偶发超时)
+        let lastErr = null;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                const rpcProxy = (config.deposit.rpcUseProxy ?? false) ? w.proxy : null;
+                const provider = buildProvider(config.deposit.ethRpcUrls ?? config.deposit.ethRpcUrl, rpcProxy, w.address);
+                const usdt = new Contract(config.deposit.usdt, ERC20_ABI, provider);
+                const [eth, ub, alw, nonce, decimals] = await Promise.all([
+                    provider.getBalance(w.address),
+                    usdt.balanceOf(w.address),
+                    usdt.allowance(w.address, config.deposit.gateway),
+                    provider.getTransactionCount(w.address),
+                    usdt.decimals(),
+                ]);
+                onchain = {
+                    eth: formatEther(eth),
+                    usdt: formatUnits(ub, decimals),
+                    allowance: alw >= 2n ** 200n ? "MAX" : formatUnits(alw, decimals),
+                    nonce,
+                };
+                lastErr = null;
+                break;
+            } catch (e) {
+                lastErr = e;
+                if (attempt < 3) {
+                    console.log(`  链上查询第 ${attempt} 次失败: ${errMsg(e).slice(0, 80)} (等 ${attempt}s 重试)`);
+                    await new Promise(r => setTimeout(r, attempt * 1000));
+                }
+            }
+        }
+        if (lastErr) {
+            onchainError = errMsg(lastErr);
+            console.log(`  链上查询 3 次重试均失败: ${onchainError.slice(0, 100)}`);
         }
         console.log(`  链上: ETH=${onchain.eth} USDT=${onchain.usdt} allowance=${onchain.allowance} nonce=${onchain.nonce}`);
     }
 
     // mode=onchain 时不查 Rho, 早返回
     if (mode === "onchain") {
-        return { address: w.address, onchain };
+        return { address: w.address, onchain, error: onchainError };
     }
 
     // ---- Rho 协议侧 (mode=all|rho) ----
@@ -226,8 +241,10 @@ async function main() {
                 const r = await checkWallet(w, w._origIdx, mode);
                 results[w._slot] = { idx: w._origIdx, ...r };
                 if (r.funding?.total) totalFunding += parseFloat(r.funding.total);
-                if (r.onchain?.eth) totalEth += parseFloat(r.onchain.eth);
-                if (r.onchain?.usdt) totalUsdt += parseFloat(r.onchain.usdt);
+                const eth = parseFloat(r.onchain?.eth);
+                if (Number.isFinite(eth)) totalEth += eth;
+                const usdt = parseFloat(r.onchain?.usdt);
+                if (Number.isFinite(usdt)) totalUsdt += usdt;
                 totalPending += r.pendingTransfers || 0;
                 totalOpenPos += r.openPositions || 0;
                 done++;
@@ -247,10 +264,12 @@ async function main() {
         const freshList = results.filter(r => r?.fundingZero && r.pendingTransfers === 0 && !r.hasDepositHistory && !r.error);
         const errorList = results.filter(r => r?.error);
 
-        // onchain 分类: 哪些钱包没 ETH/USDT (0 余额); allowance 是否 MAX (deposit 准备状态)
-        const noEthList   = mode !== "rho" ? results.filter(r => r?.onchain && parseFloat(r.onchain.eth || 0) === 0) : [];
-        const noUsdtList  = mode !== "rho" ? results.filter(r => r?.onchain && parseFloat(r.onchain.usdt || 0) === 0) : [];
-        const noApproveList = mode !== "rho" ? results.filter(r => r?.onchain && r.onchain.allowance !== "MAX") : [];
+        // onchain 分类: 只统计成功查到的钱包 (跳过 "?", 失败的进 errorList)
+        // 余额 = 0 才算 "没有"; "?" (查询失败) 不计入
+        const onchainOk = r => r?.onchain && Number.isFinite(parseFloat(r.onchain.eth));
+        const noEthList   = mode !== "rho" ? results.filter(r => onchainOk(r) && parseFloat(r.onchain.eth) === 0) : [];
+        const noUsdtList  = mode !== "rho" ? results.filter(r => onchainOk(r) && parseFloat(r.onchain.usdt) === 0) : [];
+        const noApproveList = mode !== "rho" ? results.filter(r => onchainOk(r) && r.onchain.allowance !== "MAX") : [];
 
         console.log(`\n${"=".repeat(70)}\n汇总 (mode=${mode}):`);
         console.log(`  钱包数:                ${wallets.length}`);
