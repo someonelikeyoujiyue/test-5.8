@@ -72,40 +72,57 @@ async function rhoLogin(http, w) {
     return { headers: { Authorization: `Bearer ${l.data.token}` } };
 }
 
-async function queryOnchain(w) {
+// 通用重试: 默认 3 次, 指数退避 500/1000/2000ms
+// 4xx 客户端错 (404 等) 不重试; 5xx / 408 / 429 / 网络错 重试
+async function retry(fn, attempts = 3, baseMs = 500, label = "") {
     let lastErr;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-            const rpcProxy = (config.deposit.rpcUseProxy ?? false) ? w.proxy : null;
-            const provider = buildProvider(config.deposit.ethRpcUrls ?? config.deposit.ethRpcUrl, rpcProxy, w.address);
-            const usdt = new Contract(config.deposit.usdt, ERC20_ABI, provider);
-            const [eth, ub, decimals] = await Promise.all([
-                provider.getBalance(w.address),
-                usdt.balanceOf(w.address),
-                usdt.decimals(),
-            ]);
-            return { eth: formatEther(eth), usdt: formatUnits(ub, decimals) };
-        } catch (e) {
+    for (let i = 1; i <= attempts; i++) {
+        try { return await fn(); }
+        catch (e) {
             lastErr = e;
-            if (attempt < 3) await new Promise(r => setTimeout(r, attempt * 1000));
+            const status = e?.response?.status;
+            const retriable = !status                                // 网络错 (ECONNRESET 等)
+                || status === 408 || status === 429                  // 客户端 timeout / ratelimit
+                || (status >= 500 && status < 600);                  // 5xx
+            if (!retriable || i === attempts) throw e;
+            const delay = baseMs * i;
+            if (label) console.warn(`[${ts()}] ${label} #${i} 失败 (${status || "net"}): ${errMsg(e).slice(0, 60)}, ${delay}ms 后重试`);
+            await new Promise(r => setTimeout(r, delay));
         }
     }
     throw lastErr;
 }
 
+async function queryOnchain(w) {
+    return retry(async () => {
+        const rpcProxy = (config.deposit.rpcUseProxy ?? false) ? w.proxy : null;
+        const provider = buildProvider(config.deposit.ethRpcUrls ?? config.deposit.ethRpcUrl, rpcProxy, w.address);
+        const usdt = new Contract(config.deposit.usdt, ERC20_ABI, provider);
+        const [eth, ub, decimals] = await Promise.all([
+            provider.getBalance(w.address),
+            usdt.balanceOf(w.address),
+            usdt.decimals(),
+        ]);
+        return { eth: formatEther(eth), usdt: formatUnits(ub, decimals) };
+    }, 3, 1000, `onchain[${w.address.slice(0, 10)}]`);
+}
+
 async function queryRho(w) {
     const http = makeAxios(w.proxy);
     const point = makePointAxios(w.proxy);
-    const auth = await rhoLogin(http, w);
+    const tag = w.address.slice(0, 10);
+
+    // login 加重试 (网络 / nonce race)
+    const auth = await retry(() => rhoLogin(http, w), 3, 500, `login[${tag}]`);
     const H = { headers: auth.headers };
     const addr = w.address.toLowerCase();
 
-    // 4 个接口并发, 任一失败不影响其他 (point-api 对新钱包可能 404)
+    // 4 个接口各自重试 + allSettled (任一最终失败不影响其他)
     const [maR, posR, questsR, leaderR] = await Promise.allSettled([
-        http.get("/api/v1/margin-accounts", H),
-        http.get("/api/v1/users/positions", H),
-        point.get(`/point-api/v2/users/${addr}/quests`, H),
-        point.get(`/point-api/v2/leaderboard/user?userId=${addr}`, H),
+        retry(() => http.get("/api/v1/margin-accounts", H), 3, 500, `margin[${tag}]`),
+        retry(() => http.get("/api/v1/users/positions", H), 3, 500, `pos[${tag}]`),
+        retry(() => point.get(`/point-api/v2/users/${addr}/quests`, H), 3, 500, `quests[${tag}]`),
+        retry(() => point.get(`/point-api/v2/leaderboard/user?userId=${addr}`, H), 3, 500, `leader[${tag}]`),
     ]);
 
     const out = {
