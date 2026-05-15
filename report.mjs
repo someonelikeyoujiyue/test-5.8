@@ -1,4 +1,4 @@
-// 资金汇总报告: 每钱包链上 ETH/USDT + Rho funding 账户 (total/withdrawable/IM/pnl/fees), 输出 CSV
+// 资金汇总报告: 每钱包链上 ETH/USDT + Rho funding 账户 + 积分 (totalPoints + pending quest), 输出 CSV
 //
 // 用法:
 //   node report.mjs                       全部钱包
@@ -6,7 +6,17 @@
 //   node report.mjs --c=15                并发 (默认 10)
 //   node report.mjs --out=report.csv      指定输出文件 (默认 report-YYYYMMDD-HHMMSS.csv)
 //
-// CSV 列: idx,address,eth,usdt,funding_total,withdrawable,initialMargin,pnl,fees,openPositions,error
+// CSV 列:
+//   idx,address,eth,usdt,
+//   funding_total,withdrawable,initialMargin,pnl,fees,openPositions,
+//   rank,totalPoints,lastPeriodPoints,totalQuestPoints,pendingQuestPoints,
+//   error
+//
+// 接口:
+//   api.x.rho.trading/api/v1/margin-accounts          → funding/pnl/fees
+//   api.x.rho.trading/api/v1/users/positions          → 持仓数
+//   x.rho.trading/point-api/v2/leaderboard/user       → totalPoints/rank
+//   x.rho.trading/point-api/v2/users/{addr}/quests    → totalQuestPoints/pendingQuestPoints
 
 import fs from "fs";
 import { fileURLToPath } from "url";
@@ -33,8 +43,10 @@ const errMsg = e => e?.response
     ? `${e.response.status} ${JSON.stringify(e.response.data).slice(0, 200)}`
     : (e?.shortMessage || e?.message || String(e));
 
-function makeAxios(walletProxy) {
-    const cfg = { baseURL: config.apiBase, timeout: 30000 };
+const POINT_BASE = "https://x.rho.trading";
+
+function makeAxiosWith(baseURL, walletProxy) {
+    const cfg = { baseURL, timeout: 30000 };
     if (config.useProxy && walletProxy) {
         const auth = walletProxy.username
             ? `${encodeURIComponent(walletProxy.username)}:${encodeURIComponent(walletProxy.password)}@`
@@ -44,6 +56,9 @@ function makeAxios(walletProxy) {
     }
     return axios.create(cfg);
 }
+
+const makeAxios = wp => makeAxiosWith(config.apiBase, wp);
+const makePointAxios = wp => makeAxiosWith(POINT_BASE, wp);
 
 async function rhoLogin(http, w) {
     const wallet = new Wallet(w.privateKey);
@@ -77,38 +92,80 @@ async function queryOnchain(w) {
 
 async function queryRho(w) {
     const http = makeAxios(w.proxy);
+    const point = makePointAxios(w.proxy);
     const auth = await rhoLogin(http, w);
-    const [ma, pos] = await Promise.all([
-        http.get("/api/v1/margin-accounts", { headers: auth.headers }),
-        http.get("/api/v1/users/positions", { headers: auth.headers }),
+    const H = { headers: auth.headers };
+    const addr = w.address.toLowerCase();
+
+    // 4 个接口并发, 任一失败不影响其他 (point-api 对新钱包可能 404)
+    const [maR, posR, questsR, leaderR] = await Promise.allSettled([
+        http.get("/api/v1/margin-accounts", H),
+        http.get("/api/v1/users/positions", H),
+        point.get(`/point-api/v2/users/${addr}/quests`, H),
+        point.get(`/point-api/v2/leaderboard/user?userId=${addr}`, H),
     ]);
-    const fa = ma.data.userMarginAccounts?.find(a => a.marginAccount === "funding");
-    const positions = pos.data.positions ?? [];
-    const open = positions.filter(p => parseFloat(p.notional) !== 0);
-    return {
-        funding_total: fa?.totalMargin ?? "0",
-        withdrawable: fa?.withdrawableBalance ?? "0",
-        initialMargin: fa?.initialMarginRequirement ?? "0",
-        pnl: fa?.totalPnl ?? "0",
-        fees: fa?.tradingFees ?? "0",
-        openPositions: open.length,
+
+    const out = {
+        funding_total: "0", withdrawable: "0", initialMargin: "0", pnl: "0", fees: "0", openPositions: 0,
+        rank: "", totalPoints: "0", lastPeriodPoints: "0", totalQuestPoints: "0", pendingQuestPoints: "0",
     };
+    const errs = [];
+
+    if (maR.status === "fulfilled") {
+        const fa = maR.value.data.userMarginAccounts?.find(a => a.marginAccount === "funding");
+        if (fa) {
+            out.funding_total = fa.totalMargin ?? "0";
+            out.withdrawable = fa.withdrawableBalance ?? "0";
+            out.initialMargin = fa.initialMarginRequirement ?? "0";
+            out.pnl = fa.totalPnl ?? "0";
+            out.fees = fa.tradingFees ?? "0";
+        }
+    } else errs.push(`margin: ${errMsg(maR.reason).slice(0, 60)}`);
+
+    if (posR.status === "fulfilled") {
+        const positions = posR.value.data.positions ?? [];
+        out.openPositions = positions.filter(p => parseFloat(p.notional) !== 0).length;
+    } else errs.push(`pos: ${errMsg(posR.reason).slice(0, 60)}`);
+
+    if (questsR.status === "fulfilled") {
+        out.totalQuestPoints = questsR.value.data.totalQuestPoints ?? "0";
+        out.pendingQuestPoints = questsR.value.data.pendingQuestPoints ?? "0";
+    } else errs.push(`quests: ${errMsg(questsR.reason).slice(0, 60)}`);
+
+    if (leaderR.status === "fulfilled") {
+        out.rank = leaderR.value.data.rank ?? "";
+        out.totalPoints = leaderR.value.data.totalPoints ?? "0";
+        out.lastPeriodPoints = leaderR.value.data.lastPeriodPoints ?? "0";
+    } else {
+        // leaderboard 对新钱包常常 404, 不算硬错
+        const status = leaderR.reason?.response?.status;
+        if (status !== 404) errs.push(`leader: ${errMsg(leaderR.reason).slice(0, 60)}`);
+    }
+
+    if (errs.length) out._rhoErr = errs.join(" | ");
+    return out;
 }
 
 async function processWallet(w, idx) {
     const tag = `[${String(idx).padStart(4)}] ${w.address.slice(0, 10)}`;
     let onchain = { eth: "?", usdt: "?" };
-    let rho = { funding_total: "?", withdrawable: "?", initialMargin: "?", pnl: "?", fees: "?", openPositions: "?" };
+    let rho = {
+        funding_total: "?", withdrawable: "?", initialMargin: "?", pnl: "?", fees: "?", openPositions: "?",
+        rank: "", totalPoints: "?", lastPeriodPoints: "?", totalQuestPoints: "?", pendingQuestPoints: "?",
+    };
     const errs = [];
 
     const [onR, rhR] = await Promise.allSettled([queryOnchain(w), queryRho(w)]);
     if (onR.status === "fulfilled") onchain = onR.value;
     else errs.push(`onchain: ${errMsg(onR.reason).slice(0, 80)}`);
-    if (rhR.status === "fulfilled") rho = rhR.value;
-    else errs.push(`rho: ${errMsg(rhR.reason).slice(0, 80)}`);
+    if (rhR.status === "fulfilled") {
+        rho = rhR.value;
+        if (rho._rhoErr) errs.push(rho._rhoErr);
+        delete rho._rhoErr;
+    } else errs.push(`rho: ${errMsg(rhR.reason).slice(0, 80)}`);
 
     const error = errs.join(" | ");
-    console.log(`[${ts()}] ${tag}  ETH=${onchain.eth}  USDT=${onchain.usdt}  funding=${rho.funding_total}  pnl=${rho.pnl}  fees=${rho.fees}  pos=${rho.openPositions}${error ? "  ✗ " + error : ""}`);
+    console.log(`[${ts()}] ${tag}  ETH=${onchain.eth}  USDT=${onchain.usdt}  funding=${rho.funding_total}  pnl=${rho.pnl}  pts=${rho.totalPoints}  pendingQ=${rho.pendingQuestPoints}  pos=${rho.openPositions}${error ? "  ✗ " + error : ""}`);
     return { idx, address: w.address, ...onchain, ...rho, error };
 }
 
@@ -188,7 +245,12 @@ async function main() {
 
     // 写 CSV
     const all = results.filter(Boolean).sort((a, b) => a.idx - b.idx);
-    const header = ["idx","address","eth","usdt","funding_total","withdrawable","initialMargin","pnl","fees","openPositions","error"];
+    const header = [
+        "idx","address","eth","usdt",
+        "funding_total","withdrawable","initialMargin","pnl","fees","openPositions",
+        "rank","totalPoints","lastPeriodPoints","totalQuestPoints","pendingQuestPoints",
+        "error",
+    ];
     const csv = [header.join(",")];
     for (const r of all) {
         const row = header.map(k => {
@@ -215,18 +277,29 @@ async function main() {
     const failed = all.filter(r => r.error);
     const elapsed = ((Date.now() - t0) / 1000).toFixed(0);
 
+    const totalPoints = sum("totalPoints");
+    const totalQuestP = sum("totalQuestPoints");
+    const pendingQuestP = sum("pendingQuestPoints");
+    const lastPeriodP = sum("lastPeriodPoints");
+
     console.log(`\n${"=".repeat(70)}`);
     console.log(`=== 汇总 (${elapsed}s) ===`);
-    console.log(`钱包总数:           ${all.length}`);
-    console.log(`链上 ETH 总和:      ${totalEth.toFixed(6)}`);
-    console.log(`链上 USDT 总和:     ${totalUsdt.toFixed(6)}`);
-    console.log(`funding 总和:       ${totalFunding.toFixed(4)} USDT`);
-    console.log(`withdrawable 总和:  ${sum("withdrawable").toFixed(4)} USDT`);
-    console.log(`initialMargin 总和: ${totalIM.toFixed(4)} USDT`);
-    console.log(`总 PnL:             ${totalPnl.toFixed(4)} USDT`);
-    console.log(`总 fees:            ${totalFees.toFixed(4)} USDT`);
-    console.log(`未平仓位数:         ${totalOpenPos}`);
-    console.log(`查询失败钱包:        ${failed.length}`);
+    console.log(`钱包总数:               ${all.length}`);
+    console.log(`链上 ETH 总和:          ${totalEth.toFixed(6)}`);
+    console.log(`链上 USDT 总和:         ${totalUsdt.toFixed(6)}`);
+    console.log(`funding 总和:           ${totalFunding.toFixed(4)} USDT`);
+    console.log(`withdrawable 总和:      ${sum("withdrawable").toFixed(4)} USDT`);
+    console.log(`initialMargin 总和:     ${totalIM.toFixed(4)} USDT`);
+    console.log(`总 PnL:                 ${totalPnl.toFixed(4)} USDT`);
+    console.log(`总 fees:                ${totalFees.toFixed(4)} USDT`);
+    console.log(`未平仓位数:             ${totalOpenPos}`);
+    console.log("");
+    console.log(`总 totalPoints:         ${totalPoints.toFixed(2)}  (leaderboard 累计)`);
+    console.log(`总 lastPeriodPoints:    ${lastPeriodP.toFixed(2)}  (上周期入账)`);
+    console.log(`总 totalQuestPoints:    ${totalQuestP.toFixed(2)}  (历史已结算 quest)`);
+    console.log(`总 pendingQuestPoints:  ${pendingQuestP.toFixed(2)}  (本周期待结算)`);
+    console.log("");
+    console.log(`查询失败钱包:           ${failed.length}`);
     console.log(`\nCSV → ${outFile}`);
 
     if (failed.length > 0) {
