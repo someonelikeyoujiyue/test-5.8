@@ -21,11 +21,12 @@
 //   node balance-open.mjs --c=5              并发 pair 数 (默认 5)
 //   node balance-open.mjs --yes              跳过确认
 //   node balance-open.mjs --dry-run          模拟 (打印 pair + 选 symbol, 不发单)
-//   node balance-open.mjs --force            强制重开 (默认会跳过今日 state 已有 balance-open 记录的钱包)
+//   node balance-open.mjs --force            强制重开 (跳过链上 positions 检查)
 //
-// 重复保护:
-//   默认行为: state.json 里今日 (本地时区) 已有 balance-open record 的钱包会被跳过, 防止重跑叠加仓位
-//   要重开请加 --force (或者前一笔 cleanup.mjs 平了之后, state record 还在 → 仍会被跳过, 这时需要 --force)
+// 重复保护 (默认):
+//   启动时查每钱包链上 positions, |净暴露| > 5 USDT 的钱包视为"已开过 + 未平", 跳过
+//   平了 (cleanup 或自然结算) 的钱包会自动再次参与配对
+//   --force 完全跳过此检查 (用于已知要叠加的场景)
 //
 // 之后平仓:
 //   node cleanup.mjs <成功 pair 的所有 idx>     # 用 close-position flag 把两边平掉
@@ -371,28 +372,74 @@ async function main() {
 
     if (wallets.length < 2) { console.log("至少 2 个钱包"); process.exit(1); }
 
-    // 重复保护: state.json 今日已有 balance-open 记录的钱包默认跳过 (避免叠加仓位)
-    // --force 跳过这个检查
+    // 重复保护: 查链上 positions, 有未平仓位的钱包视为"已开过 + 未平", 跳过
+    //   - net notional 总和 ≤ POS_TOLERANCE USDT 视为"已配平/无暴露" → 加入 pair pool
+    //   - 有暴露 → 跳过 (让用户先 cleanup.mjs 平了再重开)
+    //   - --force 完全跳过此检查
+    const POS_TOLERANCE = 5;   // USDT, 小误差忽略
     const stateFile = join(__dirname, config.stateFile);
     const state = loadState(stateFile);
     const today = dayKey(new Date(), config.dayBoundary || "local");
-    const skippedByState = [];
+    const skippedByPos = [];
+    const exposureSummary = [];   // [{idx, exposure}] 暴露的钱包
+
     if (!force) {
-        const filtered = wallets.filter(w => {
-            const arr = state[w.address.toLowerCase()]?.runs?.[today]?.[STRATEGY] ?? [];
-            if (arr.length > 0) {
-                skippedByState.push(w.idx);
-                return false;
+        console.log(`[${ts()}] 查链上 positions (${wallets.length} 钱包, 并发 ${concurrentPairs * 2})...`);
+        const posCheckQueue = [...wallets];
+        const posMap = new Map();
+        const posWorkers = [];
+        for (let i = 0; i < Math.min(concurrentPairs * 2, posCheckQueue.length); i++) {
+            posWorkers.push((async () => {
+                while (posCheckQueue.length) {
+                    const w = posCheckQueue.shift();
+                    if (!w) break;
+                    try {
+                        const c = await buildClient(w);
+                        const pos = (await c.getPositions()).positions ?? [];
+                        const open = pos.filter(p => parseFloat(p.notional) !== 0);
+                        const netExposure = open.reduce((s, p) => {
+                            const n = Math.abs(parseFloat(p.notional));
+                            return p.riskDirection === "long" ? s + n : s - n;
+                        }, 0);
+                        posMap.set(w.idx, { open, netExposure });
+                    } catch (e) {
+                        posMap.set(w.idx, { error: errMsg(e).slice(0, 60) });
+                    }
+                }
+            })());
+        }
+        await Promise.all(posWorkers);
+
+        const filtered = [];
+        for (const w of wallets) {
+            const p = posMap.get(w.idx);
+            if (p?.error) {
+                console.warn(`[${ts()}] [${w.idx}] 查 positions 失败: ${p.error}, 谨慎起见跳过`);
+                skippedByPos.push(w.idx);
+                continue;
             }
-            return true;
-        });
+            const absExp = Math.abs(p.netExposure || 0);
+            if (absExp > POS_TOLERANCE) {
+                exposureSummary.push({ idx: w.idx, exposure: p.netExposure, count: p.open.length });
+                skippedByPos.push(w.idx);
+            } else {
+                filtered.push(w);
+            }
+        }
         wallets = filtered;
     }
 
     if (wallets.length < 2) {
-        console.log(`!! 可用钱包不足 2 个 (${skippedByState.length} 已跳过), 退出`);
-        if (skippedByState.length > 0) console.log(`   今日已开过 balance-open 的钱包: ${skippedByState.join(",")}`);
-        console.log(`   要强制重开请加 --force`);
+        console.log(`!! 可用钱包不足 2 个 (跳过 ${skippedByPos.length} 个有暴露/查询失败的钱包)`);
+        if (exposureSummary.length > 0) {
+            console.log(`   暴露钱包明细 (idx: net notional):`);
+            for (const x of exposureSummary.slice(0, 20)) {
+                console.log(`     [${x.idx}] net=${x.exposure.toFixed(2)} USDT (${x.count} 个未平仓位)`);
+            }
+            if (exposureSummary.length > 20) console.log(`     ... 还有 ${exposureSummary.length - 20} 个`);
+            console.log(`   要平掉这些钱包: node cleanup.mjs ${exposureSummary.slice(0, 30).map(x => x.idx).join(" ")}`);
+        }
+        console.log(`   要无视检查强制重开请加 --force`);
         process.exit(0);
     }
 
@@ -404,7 +451,7 @@ async function main() {
     const dropped = wallets.length % 2 === 1 ? shuffled[shuffled.length - 1] : null;
 
     console.log(`=== 配平开仓 (balance-open) ${dryRun ? "(DRY-RUN)" : "实盘"}${force ? " [FORCE]" : ""} ===`);
-    console.log(`钱包: ${wallets.length}${skippedByState.length > 0 ? ` (今日已开过跳过 ${skippedByState.length}: ${skippedByState.slice(0, 10).join(",")}${skippedByState.length > 10 ? "..." : ""})` : ""} | pair: ${pairs.length}${dropped ? ` | 落单: idx=${dropped.idx}` : ""} | 并发 pair: ${concurrentPairs}`);
+    console.log(`钱包: ${wallets.length}${skippedByPos.length > 0 ? ` (跳过 ${skippedByPos.length} 个有暴露/查询失败)` : ""} | pair: ${pairs.length}${dropped ? ` | 落单: idx=${dropped.idx}` : ""} | 并发 pair: ${concurrentPairs}`);
     console.log(`notional: [${config.instant.notionalUsdRange.join(", ")}] (复用 instant)`);
     console.log(`市场不重复: pair union < ${config.instant.minDistinctMarketsPerWeek} 时强制选未交易过的 market`);
     console.log(`!! 配平开仓后不平仓, 由你手动 cleanup.mjs / trade.mjs cleanupOnStart 平掉\n`);
