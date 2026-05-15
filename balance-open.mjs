@@ -21,6 +21,11 @@
 //   node balance-open.mjs --c=5              并发 pair 数 (默认 5)
 //   node balance-open.mjs --yes              跳过确认
 //   node balance-open.mjs --dry-run          模拟 (打印 pair + 选 symbol, 不发单)
+//   node balance-open.mjs --force            强制重开 (默认会跳过今日 state 已有 balance-open 记录的钱包)
+//
+// 重复保护:
+//   默认行为: state.json 里今日 (本地时区) 已有 balance-open record 的钱包会被跳过, 防止重跑叠加仓位
+//   要重开请加 --force (或者前一笔 cleanup.mjs 平了之后, state record 还在 → 仍会被跳过, 这时需要 --force)
 //
 // 之后平仓:
 //   node cleanup.mjs <成功 pair 的所有 idx>     # 用 close-position flag 把两边平掉
@@ -351,6 +356,7 @@ async function main() {
     const args = process.argv.slice(2);
     const dryRun = args.includes("--dry-run");
     const skipConfirm = args.includes("--yes");
+    const force = args.includes("--force");
     const concurrentPairs = parseInt(parseFlag(args, "concurrency", "c") || "5");
     if (concurrentPairs < 1 || concurrentPairs > 50) { console.log("--c 必须 1-50"); process.exit(1); }
 
@@ -365,6 +371,31 @@ async function main() {
 
     if (wallets.length < 2) { console.log("至少 2 个钱包"); process.exit(1); }
 
+    // 重复保护: state.json 今日已有 balance-open 记录的钱包默认跳过 (避免叠加仓位)
+    // --force 跳过这个检查
+    const stateFile = join(__dirname, config.stateFile);
+    const state = loadState(stateFile);
+    const today = dayKey(new Date(), config.dayBoundary || "local");
+    const skippedByState = [];
+    if (!force) {
+        const filtered = wallets.filter(w => {
+            const arr = state[w.address.toLowerCase()]?.runs?.[today]?.[STRATEGY] ?? [];
+            if (arr.length > 0) {
+                skippedByState.push(w.idx);
+                return false;
+            }
+            return true;
+        });
+        wallets = filtered;
+    }
+
+    if (wallets.length < 2) {
+        console.log(`!! 可用钱包不足 2 个 (${skippedByState.length} 已跳过), 退出`);
+        if (skippedByState.length > 0) console.log(`   今日已开过 balance-open 的钱包: ${skippedByState.join(",")}`);
+        console.log(`   要强制重开请加 --force`);
+        process.exit(0);
+    }
+
     const shuffled = shuffle(wallets);
     const pairs = [];
     for (let i = 0; i + 1 < shuffled.length; i += 2) {
@@ -372,8 +403,8 @@ async function main() {
     }
     const dropped = wallets.length % 2 === 1 ? shuffled[shuffled.length - 1] : null;
 
-    console.log(`=== 配平开仓 (balance-open) ${dryRun ? "(DRY-RUN)" : "实盘"} ===`);
-    console.log(`钱包: ${wallets.length} | pair: ${pairs.length}${dropped ? ` | 落单: idx=${dropped.idx}` : ""} | 并发 pair: ${concurrentPairs}`);
+    console.log(`=== 配平开仓 (balance-open) ${dryRun ? "(DRY-RUN)" : "实盘"}${force ? " [FORCE]" : ""} ===`);
+    console.log(`钱包: ${wallets.length}${skippedByState.length > 0 ? ` (今日已开过跳过 ${skippedByState.length}: ${skippedByState.slice(0, 10).join(",")}${skippedByState.length > 10 ? "..." : ""})` : ""} | pair: ${pairs.length}${dropped ? ` | 落单: idx=${dropped.idx}` : ""} | 并发 pair: ${concurrentPairs}`);
     console.log(`notional: [${config.instant.notionalUsdRange.join(", ")}] (复用 instant)`);
     console.log(`市场不重复: pair union < ${config.instant.minDistinctMarketsPerWeek} 时强制选未交易过的 market`);
     console.log(`!! 配平开仓后不平仓, 由你手动 cleanup.mjs / trade.mjs cleanupOnStart 平掉\n`);
@@ -391,10 +422,7 @@ async function main() {
         ]);
         console.log(`[${ts()}] exchange/info ${exchangeInfo.symbols?.length} symbols | tickers ${Object.keys(tickers).length}`);
     } catch (e) { console.error(`fetch 失败: ${errMsg(e)}`); process.exit(1); }
-
-    const stateFile = join(__dirname, config.stateFile);
-    const state = loadState(stateFile);
-    const today = dayKey(new Date(), config.dayBoundary || "local");
+    // state / today 已在前面重复保护处加载
 
     const t0 = Date.now();
     const queue = [...pairs];
