@@ -1,10 +1,13 @@
 // 资金汇总报告: 每钱包链上 ETH/USDT + Rho funding 账户 + 积分 (totalPoints + pending quest), 输出 CSV
 //
 // 用法:
-//   node report.mjs                       全部钱包
+//   node report.mjs                       全部钱包 (默认输出 report-YYYYMMDD-HHMMSS.csv)
 //   node report.mjs 1-100                 钱包 1-100
 //   node report.mjs --c=15                并发 (默认 10)
-//   node report.mjs --out=report.csv      指定输出文件 (默认 report-YYYYMMDD-HHMMSS.csv)
+//   node report.mjs --out=report.csv      指定输出文件 → append/merge 模式:
+//                                            - 文件不存在: 新建写入
+//                                            - 文件存在 + header 一致: 按 idx 合并, 新数据覆盖旧
+//                                            - header 不一致: 旧文件备份 .bak, 写新
 //
 // CSV 列:
 //   idx,address,eth,usdt,
@@ -243,7 +246,7 @@ async function main() {
     }
     await Promise.all(workers);
 
-    // 写 CSV
+    // 写 CSV (合并模式: outFile 已存在 → 按 idx 去重, 新数据覆盖旧)
     const all = results.filter(Boolean).sort((a, b) => a.idx - b.idx);
     const header = [
         "idx","address","eth","usdt",
@@ -251,16 +254,40 @@ async function main() {
         "rank","totalPoints","lastPeriodPoints","totalQuestPoints","pendingQuestPoints",
         "error",
     ];
-    const csv = [header.join(",")];
-    for (const r of all) {
-        const row = header.map(k => {
-            const v = r[k] ?? "";
-            const s = String(v);
-            return s.includes(",") || s.includes('"') ? `"${s.replace(/"/g, '""')}"` : s;
-        });
-        csv.push(row.join(","));
+    const csvEscape = v => {
+        const s = String(v ?? "");
+        return s.includes(",") || s.includes('"') || s.includes("\n") ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const renderRow = r => header.map(k => csvEscape(r[k])).join(",");
+
+    // 旧行: idx → 原始行字符串 (保留 header 一致时的历史数据)
+    const existing = new Map();
+    let mergedCount = 0;
+    if (fs.existsSync(outFile)) {
+        const lines = fs.readFileSync(outFile, "utf8").split(/\r?\n/).filter(s => s.length);
+        if (lines.length > 0) {
+            const oldHeader = lines[0].split(",");
+            const headerMatch = oldHeader.length === header.length && oldHeader.every((h, i) => h === header[i]);
+            if (!headerMatch) {
+                const bak = outFile + ".bak-" + fmtTs();
+                fs.renameSync(outFile, bak);
+                console.log(`!! 旧文件 header 不匹配, 备份到 ${bak}, 写新文件`);
+            } else {
+                for (let i = 1; i < lines.length; i++) {
+                    const idx = parseInt(lines[i].split(",")[0]);   // idx 是纯整数, 不会被 quote
+                    if (Number.isFinite(idx)) existing.set(idx, lines[i]);
+                }
+                mergedCount = existing.size;
+                console.log(`已存在 ${outFile}: ${mergedCount} 行, append/merge (新 idx 覆盖旧)`);
+            }
+        }
     }
-    fs.writeFileSync(outFile, csv.join("\n") + "\n");
+    for (const r of all) existing.set(r.idx, renderRow(r));   // 新覆盖旧
+    const finalRows = [...existing.entries()].sort((a, b) => a[0] - b[0]).map(([, line]) => line);
+    fs.writeFileSync(outFile, [header.join(","), ...finalRows].join("\n") + "\n");
+    if (mergedCount > 0) {
+        console.log(`合并完成: 旧 ${mergedCount} + 新 ${all.length} → 文件共 ${finalRows.length} 行 (按 idx 去重)`);
+    }
 
     // 汇总
     const sum = k => all.reduce((s, r) => {
