@@ -232,6 +232,40 @@ async function fillIoc(client, symbol, side, target, opts, log, cidPrefix) {
     return { fills, totalVol, totalFee, lastTrade };
 }
 
+// Cleanup 模式: exposed 残量过小 (< minNotional 100, 无法用 IOC 反向), 直接 close-position 平掉
+async function processCleanup({ exposedWallet, exposedPosition, state, today, dryRun }) {
+    const e = exposedWallet;
+    const pos = exposedPosition;
+    const vol = Math.abs(parseFloat(pos.notional));
+    const tag = `[${e.idx}-cleanup]`;
+    const log = m => console.log(`[${ts()}] ${tag} ${m}`);
+
+    log(`残量 ${vol} ${pos.riskDirection} ${pos.symbol} < minNotional 100, close-position 自平`);
+    if (dryRun) {
+        log(`[DRY] close-position ${pos.symbol}`);
+        return { ok: true, dry: true, mode: "cleanup", pair: [e.idx], symbol: pos.symbol, notional: vol };
+    }
+
+    let client;
+    try { client = await buildClient(e); }
+    catch (err) { return { ok: false, error: `login: ${errMsg(err)}`, mode: "cleanup", pair: [e.idx] }; }
+
+    const cid = `bc${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`.slice(0, 36);
+    try {
+        const r = await client.createOrder({
+            orderType: "market", symbol: pos.symbol, timeInForce: "IOC",
+            flags: ["close-position"], clientOrderId: cid,
+        });
+        const tr = r.trades?.[0];
+        if (tr) log(`✓ closed ${pos.symbol} fill=${tr.price}@${tr.volume} fee=${tr.tradingFees}`);
+        else log(`✓ close-position 发出 (无 trade 回执, 可能已 0)`);
+        return { ok: true, mode: "cleanup", pair: [e.idx], symbol: pos.symbol, notional: vol };
+    } catch (err) {
+        log(`✗ close-position 失败: ${errMsg(err)}`);
+        return { ok: false, error: `close-position: ${errMsg(err)}`, mode: "cleanup", pair: [e.idx] };
+    }
+}
+
 // Hedge 模式: 一个钱包已有持仓 (exposed), 让另一个无持仓钱包 (free) 反向开同 symbol 同量配平
 // 不动 exposed 钱包, 只在 free 钱包发反向单 (省 1 笔 fee, 也不需要 cleanup 残留)
 async function processHedge({ exposedWallet, freeWallet, exposedPosition, state, today, dryRun }) {
@@ -523,10 +557,20 @@ async function main() {
         free = wallets;   // --force: 不查链上, 全部当 free
     }
 
-    // Hedge pair: 把 exposed 跟 free 一一配对 (--complete 启用)
+    // --complete 模式: 分类 exposed 为 hedge / cleanup
+    //   - vol < 100 (minNotional): IOC 反向不可下, 用 close-position 自平 (cleanupPairs)
+    //   - vol ≥ 100 + 有 free 钱包: 拉 free 反向开 (hedgePairs)
+    //   - vol ≥ 100 + 无 free: 跳过 (warn)
+    const HEDGE_MIN_VOL = 100;   // USDT, 小于此值必须 close-position 自平
     const hedgePairs = [];
+    const cleanupPairs = [];
     if (complete && exposed.length > 0) {
         for (const e of exposed) {
+            const vol = Math.abs(parseFloat(e.position.notional));
+            if (vol < HEDGE_MIN_VOL) {
+                cleanupPairs.push({ exposedWallet: e.w, position: e.position });
+                continue;
+            }
             if (free.length === 0) {
                 skipped.exposedUnpaired.push(e);
                 continue;
@@ -547,7 +591,7 @@ async function main() {
     }
     const dropped = freeShuffled.length % 2 === 1 ? freeShuffled[freeShuffled.length - 1] : null;
 
-    if (hedgePairs.length === 0 && normalPairs.length === 0) {
+    if (hedgePairs.length === 0 && normalPairs.length === 0 && cleanupPairs.length === 0) {
         console.log(`!! 没有可执行的 pair`);
         if (skipped.exposedUnpaired.length > 0) {
             console.log(`   暴露但无 free 配对 (${skipped.exposedUnpaired.length} 个, ${complete ? "需要更多无持仓钱包" : "默认跳过, 加 --complete 让 free 反向补"}):`);
@@ -561,16 +605,16 @@ async function main() {
         process.exit(0);
     }
 
-    const totalPairs = hedgePairs.length + normalPairs.length;
+    const totalPairs = hedgePairs.length + normalPairs.length + cleanupPairs.length;
     console.log(`=== 配平开仓 (balance-open) ${dryRun ? "(DRY-RUN)" : "实盘"}${force ? " [FORCE]" : ""}${complete ? " [COMPLETE]" : ""} ===`);
-    console.log(`钱包: ${wallets.length} | free: ${freeShuffled.length} | exposed: ${exposed.length} (${hedgePairs.length} 找到 hedge partner)${dropped ? ` | 落单: idx=${dropped.idx}` : ""} | 并发: ${concurrentPairs}`);
-    console.log(`Pair 计划: ${hedgePairs.length} 个 hedge (补已开) + ${normalPairs.length} 个 normal (新开) = ${totalPairs} 总`);
-    if (skipped.exposedUnpaired.length > 0) console.log(`!! 暴露但跳过 ${skipped.exposedUnpaired.length} 个 (${complete ? "没足够 free partner" : "默认跳过, 加 --complete 让 free 反向补"})`);
+    console.log(`钱包: ${wallets.length} | free: ${freeShuffled.length} | exposed: ${exposed.length} (${hedgePairs.length} hedge + ${cleanupPairs.length} cleanup)${dropped ? ` | 落单: idx=${dropped.idx}` : ""} | 并发: ${concurrentPairs}`);
+    console.log(`任务计划: ${cleanupPairs.length} 个 cleanup (残量<100 自平) + ${hedgePairs.length} 个 hedge (free 反向补) + ${normalPairs.length} 个 normal (新开) = ${totalPairs} 总`);
+    if (skipped.exposedUnpaired.length > 0) console.log(`!! 暴露但跳过 ${skipped.exposedUnpaired.length} 个 (${complete ? "没足够 free partner" : "默认跳过, 加 --complete 自动处理"})`);
     if (skipped.complex.length > 0) console.log(`!! 跳过 (查询失败/多持仓 ${skipped.complex.length}): ${skipped.complex.map(c => c.idx).join(",")}`);
     console.log(`notional: [${config.instant.notionalUsdRange.join(", ")}] (normal pair); hedge 量 = exposed 持仓量\n`);
 
     if (!dryRun && !skipConfirm) {
-        const ok = await confirm(`将开 ${totalPairs} 对 (${hedgePairs.length} hedge + ${normalPairs.length} normal), 确认? (yes/no) `);
+        const ok = await confirm(`将执行 ${totalPairs} 个任务 (${cleanupPairs.length} cleanup + ${hedgePairs.length} hedge + ${normalPairs.length} normal), 确认? (yes/no) `);
         if (!ok) { console.log("取消"); return; }
     }
 
@@ -584,8 +628,9 @@ async function main() {
     } catch (e) { console.error(`fetch 失败: ${errMsg(e)}`); process.exit(1); }
 
     const t0 = Date.now();
-    // queue: 先 hedge 后 normal (任务类型混在一起, worker 取出来按 type 分发)
+    // queue: cleanup → hedge → normal (混在一起, worker 按 type 分发)
     const queue = [
+        ...cleanupPairs.map(c => ({ type: "cleanup", data: c })),
         ...hedgePairs.map(h => ({ type: "hedge", data: h })),
         ...normalPairs.map(p => ({ type: "normal", data: p })),
     ];
@@ -598,7 +643,13 @@ async function main() {
                 const task = queue.shift();
                 if (!task) break;
                 let r;
-                if (task.type === "hedge") {
+                if (task.type === "cleanup") {
+                    r = await processCleanup({
+                        exposedWallet: task.data.exposedWallet,
+                        exposedPosition: task.data.position,
+                        state, today, dryRun,
+                    });
+                } else if (task.type === "hedge") {
                     r = await processHedge({
                         exposedWallet: task.data.exposedWallet,
                         freeWallet: task.data.freeWallet,
@@ -625,11 +676,12 @@ async function main() {
     const fail = results.filter(r => !r.ok);
     const elapsed = ((Date.now() - t0) / 1000).toFixed(0);
 
+    const cleanupOk = ok.filter(r => r.mode === "cleanup");
     const hedgeOk = ok.filter(r => r.mode === "hedge");
-    const normalOk = ok.filter(r => r.mode !== "hedge");
+    const normalOk = ok.filter(r => !r.mode || (r.mode !== "cleanup" && r.mode !== "hedge"));
     console.log(`\n${"=".repeat(70)}`);
     console.log(`=== 完成 (${elapsed}s) ===`);
-    console.log(`Pair: ${totalPairs} (${hedgePairs.length} hedge + ${normalPairs.length} normal) | 成功: ${ok.length} (${hedgeOk.length} hedge + ${normalOk.length} normal) | 失败: ${fail.length}`);
+    console.log(`任务: ${totalPairs} (${cleanupPairs.length} cleanup + ${hedgePairs.length} hedge + ${normalPairs.length} normal) | 成功: ${ok.length} (${cleanupOk.length} cleanup + ${hedgeOk.length} hedge + ${normalOk.length} normal) | 失败: ${fail.length}`);
     if (fail.length) {
         console.log(`\n失败 pair:`);
         for (const r of fail) console.log(`  [${r.pair?.join(",")}] ${r.mode === "hedge" ? "(hedge)" : ""} ${r.error}`);
