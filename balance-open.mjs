@@ -484,6 +484,7 @@ async function main() {
     const dryRun = args.includes("--dry-run");
     const skipConfirm = args.includes("--yes");
     const force = args.includes("--force");
+    const addNew = args.includes("--add-new");   // 强制允许 free 钱包配 normal pair (新开)
     const concurrentPairs = parseInt(parseFlag(args, "concurrency", "c") || "5");
     if (concurrentPairs < 1 || concurrentPairs > 50) { console.log("--c 必须 1-50"); process.exit(1); }
 
@@ -607,13 +608,23 @@ async function main() {
         free = wallets;   // --force: 全部当 free shuffle
     }
 
-    // Normal pair: 剩余 free 内部 shuffle 两两配对
-    const freeShuffled = shuffle(free);
+    // 自动判断是否开 normal pair:
+    //   - --add-new 显式启用 → 开
+    //   - 所有钱包都无持仓 (首次场景) → 开
+    //   - 任何钱包已有持仓 (后续补完场景) → **不开** (避免反复叠加新仓)
+    //   - --force → 当 free 没问题, 开
+    const hasAnyExisting = !force && (cleanupPairs.length > 0 || hedgePairs.length > 0 || skipped.exposedUnpaired.length > 0
+        || wallets.length !== free.length);   // free.length < wallets.length 意味着有钱包已 paired
+    const allowNormalPair = force || addNew || !hasAnyExisting;
+
+    // Normal pair: 剩余 free 内部 shuffle 两两配对 (仅在 allowNormalPair 时)
+    const freeShuffled = allowNormalPair ? shuffle(free) : [];
     const normalPairs = [];
     for (let i = 0; i + 1 < freeShuffled.length; i += 2) {
         normalPairs.push([freeShuffled[i], freeShuffled[i + 1]]);
     }
     const dropped = freeShuffled.length % 2 === 1 ? freeShuffled[freeShuffled.length - 1] : null;
+    const freeSkipped = !allowNormalPair ? free.length : 0;   // 不开 normal pair 时 free 被跳过
 
     if (hedgePairs.length === 0 && normalPairs.length === 0 && cleanupPairs.length === 0) {
         console.log(`!! 没有可执行的 pair`);
@@ -629,9 +640,10 @@ async function main() {
         process.exit(0);
     }
 
+    const exposedCount = hedgePairs.length + cleanupPairs.length + skipped.exposedUnpaired.length;
     const totalPairs = hedgePairs.length + normalPairs.length + cleanupPairs.length;
-    console.log(`=== 配平开仓 (balance-open) ${dryRun ? "(DRY-RUN)" : "实盘"}${force ? " [FORCE]" : ""} ===`);
-    console.log(`钱包: ${wallets.length} | free: ${freeShuffled.length} | exposed: ${exposed.length} (${hedgePairs.length} hedge + ${cleanupPairs.length} cleanup)${dropped ? ` | 落单: idx=${dropped.idx}` : ""} | 并发: ${concurrentPairs}`);
+    console.log(`=== 配平开仓 (balance-open) ${dryRun ? "(DRY-RUN)" : "实盘"}${force ? " [FORCE]" : ""}${addNew ? " [ADD-NEW]" : ""} ===`);
+    console.log(`钱包: ${wallets.length} | free: ${free.length}${freeSkipped > 0 ? ` (跳过开新 pair, 加 --add-new 启用)` : ""} | exposed: ${exposedCount} (${hedgePairs.length} hedge + ${cleanupPairs.length} cleanup)${dropped ? ` | 落单: idx=${dropped.idx}` : ""} | 并发: ${concurrentPairs}`);
     console.log(`任务计划: ${cleanupPairs.length} 个 cleanup (残量<100 自平) + ${hedgePairs.length} 个 hedge (free 反向补) + ${normalPairs.length} 个 normal (新开) = ${totalPairs} 总`);
     if (skipped.exposedUnpaired.length > 0) console.log(`!! 暴露但无 free partner 跳过 ${skipped.exposedUnpaired.length}`);
     if (skipped.complex.length > 0) console.log(`!! 跳过 (查询失败/多持仓 ${skipped.complex.length}): ${skipped.complex.map(c => c.idx).join(",")}`);
