@@ -117,7 +117,7 @@ function pickNotional() {
     return cfg.notionalUsd ?? 1005;
 }
 
-function selectSymbolForPair({ exchangeInfo, tickers, notional, pairTradedUnion }) {
+function selectSymbolForPair({ exchangeInfo, tickers, notional, tradedA, tradedB, minDistinct }) {
     const cfg = config.instant;
     let candidates = exchangeInfo.symbols.filter(s => {
         if (s.isExpired || s.isLockedUp || s.pausedOrders) return false;
@@ -139,11 +139,29 @@ function selectSymbolForPair({ exchangeInfo, tickers, notional, pairTradedUnion 
     ));
     if (!candidates.length) return null;
 
-    // 多样性: pair union 没碰过的 market 优先
-    const minDistinct = cfg.minDistinctMarketsPerWeek ?? 3;
-    if (pairTradedUnion.size < minDistinct) {
-        const untraded = candidates.filter(s => !pairTradedUnion.has(symbolToMarket(s.symbol)));
-        if (untraded.length > 0) candidates = untraded;
+    // 多样性: 按每钱包独立判断 distinct 缺口
+    // - 都没满 → 优先选双赢 (A,B 都没碰过); 没双赢退到至少一边没碰过
+    // - 只 A 没满 → 选 A 没碰过的 (B 重不重复无所谓, B 已经达 quest)
+    // - 只 B 没满 → 选 B 没碰过的
+    // - 都满了 → 不强制, 纯随机
+    const needA = tradedA.size < minDistinct;
+    const needB = tradedB.size < minDistinct;
+    const aHas = s => tradedA.has(symbolToMarket(s.symbol));
+    const bHas = s => tradedB.has(symbolToMarket(s.symbol));
+
+    if (needA && needB) {
+        const both = candidates.filter(s => !aHas(s) && !bHas(s));
+        if (both.length > 0) candidates = both;
+        else {
+            const either = candidates.filter(s => !aHas(s) || !bHas(s));
+            if (either.length > 0) candidates = either;
+        }
+    } else if (needA) {
+        const aMiss = candidates.filter(s => !aHas(s));
+        if (aMiss.length > 0) candidates = aMiss;
+    } else if (needB) {
+        const bMiss = candidates.filter(s => !bHas(s));
+        if (bMiss.length > 0) candidates = bMiss;
     }
 
     // 近月优先, 同 underlying 内随机
@@ -218,13 +236,15 @@ async function processPair({ pair, exchangeInfo, tickers, state, today, dryRun }
     const log = m => console.log(`[${ts()}] ${tag} ${m}`);
 
     const lookback = config.instant.lookbackDays ?? 7;
+    const minDistinct = config.instant.minDistinctMarketsPerWeek ?? 3;
     const trA = tradedMarketsFor(state, a.address, today, lookback, config.dayBoundary);
     const trB = tradedMarketsFor(state, b.address, today, lookback, config.dayBoundary);
-    const union = new Set([...trA, ...trB]);
-    log(`pair union markets (${union.size}): [${[...union].join(", ")}]`);
+    const needA = trA.size < minDistinct;
+    const needB = trB.size < minDistinct;
+    log(`A=${a.idx} markets=${trA.size}/${minDistinct} ${needA ? "缺" : "✓"} | B=${b.idx} markets=${trB.size}/${minDistinct} ${needB ? "缺" : "✓"}`);
 
     const notional = pickNotional();
-    const sym = selectSymbolForPair({ exchangeInfo, tickers, notional, pairTradedUnion: union });
+    const sym = selectSymbolForPair({ exchangeInfo, tickers, notional, tradedA: trA, tradedB: trB, minDistinct });
     if (!sym) {
         log(`✗ 无可用 symbol`);
         return { ok: false, error: "no candidate symbol", pair: [a.idx, b.idx] };
