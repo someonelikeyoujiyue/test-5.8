@@ -21,14 +21,14 @@
 //   node balance-open.mjs --c=5              并发 pair 数 (默认 5)
 //   node balance-open.mjs --yes              跳过确认
 //   node balance-open.mjs --dry-run          模拟 (打印 pair + 选 symbol, 不发单)
-//   node balance-open.mjs --force            强制重开 (跳过链上 positions 检查)
-//   node balance-open.mjs --complete         补齐模式: 暴露的钱包找无持仓钱包反向开同 symbol 同量, 不动 exposed
+//   node balance-open.mjs --force            强制 (跳过链上检查, 不管已有持仓直接 shuffle 配对)
 //
-// 三种模式 (互斥):
-//   默认:        启动查 positions, exposed (净 > 5 USDT) 跳过 + 提示用 cleanup; free 内部两两 pair
-//   --complete:  exposed 钱包不动, 拉一个 free 钱包反向开同量 hedge; 剩余 free 内部 pair
-//                适合"小残量 (rollback 没平干净)" 的低成本配平 (单边 fee 代替双边)
-//   --force:     不查链上, 全部当 free 强制两两 pair
+// 默认行为 (再跑同命令自动补完):
+//   1. 查链上 positions, 按 symbol 集合内贪婪配对 long↔short
+//   2. 已配平的钱包 skip (本轮无动作)
+//   3. 残留 < 100 USDT  → 自动 close-position 平掉
+//   4. 残留 ≥ 100 USDT  → 找 free 钱包反向开同量 hedge (free 不够则退化 cleanup)
+//   5. 完全无持仓的 free 钱包 → 内部两两 normal pair (新开)
 //
 // 之后平仓:
 //   node cleanup.mjs <成功 pair 的所有 idx>     # 用 close-position flag 把两边平掉
@@ -484,7 +484,6 @@ async function main() {
     const dryRun = args.includes("--dry-run");
     const skipConfirm = args.includes("--yes");
     const force = args.includes("--force");
-    const complete = args.includes("--complete");
     const concurrentPairs = parseInt(parseFlag(args, "concurrency", "c") || "5");
     if (concurrentPairs < 1 || concurrentPairs > 50) { console.log("--c 必须 1-50"); process.exit(1); }
 
@@ -499,17 +498,23 @@ async function main() {
 
     if (wallets.length < 2) { console.log("至少 2 个钱包"); process.exit(1); }
 
-    // 查链上 positions, 分类:
-    //   free      = 0 持仓 (净暴露 ≤ POS_TOLERANCE, 可参与新 pair 或 hedge partner)
-    //   exposed   = 1 个 open position 且 net > POS_TOLERANCE (--complete 时找 free 反向补)
-    //   complex   = 多 open positions 或查询失败 (太复杂, 跳过 + warn)
-    const POS_TOLERANCE = 5;   // USDT
+    // 默认: 查链上 positions, 自动检测+补完未配平的钱包 (再跑同命令自动收尾)
+    //   1. 按 symbol 把 selected 钱包内 long/short 贪婪配对 (vol 大到小)
+    //   2. 配对后剩余 (单边 + vol > 容差) 视为 exposed 残留
+    //      - residualVol < 100  → cleanup (close-position 自平)
+    //      - residualVol ≥ 100 + 有 free partner → hedge (free 反向同量开)
+    //      - residualVol ≥ 100 + 无 free → 退化为 cleanup
+    //   3. 没参与 pair 的钱包 = free pool, 内部两两 normal pair
+    // --force: 跳过链上检查, 全部当 free (旧行为, 强制叠加)
+    const TOLERANCE = 0.5;       // 集合内 long/short 配平容差 (USDT)
+    const HEDGE_MIN_VOL = 100;   // 残留 < 此值必须 close-position
     const stateFile = join(__dirname, config.stateFile);
     const state = loadState(stateFile);
     const today = dayKey(new Date(), config.dayBoundary || "local");
     const skipped = { complex: [], exposedUnpaired: [] };
     let free = [];
-    let exposed = [];   // [{w, position, netExposure}]
+    let cleanupPairs = [];
+    let hedgePairs = [];
 
     if (!force) {
         console.log(`[${ts()}] 查链上 positions (${wallets.length} 钱包, 并发 ${concurrentPairs * 2})...`);
@@ -525,11 +530,7 @@ async function main() {
                         const c = await buildClient(w);
                         const pos = (await c.getPositions()).positions ?? [];
                         const open = pos.filter(p => parseFloat(p.notional) !== 0);
-                        const netExposure = open.reduce((s, p) => {
-                            const n = Math.abs(parseFloat(p.notional));
-                            return p.riskDirection === "long" ? s + n : s - n;
-                        }, 0);
-                        posMap.set(w.idx, { open, netExposure });
+                        posMap.set(w.idx, { open });
                     } catch (e) {
                         posMap.set(w.idx, { error: errMsg(e).slice(0, 60) });
                     }
@@ -538,49 +539,72 @@ async function main() {
         }
         await Promise.all(posWorkers);
 
+        // 按 symbol 收集所有 selected 钱包的持仓
+        const symItems = {};   // sym → { longs: [{w, vol, pos}], shorts: [...] }
+        const errorIdxs = new Set();
+        const exposedIdxs = new Set();
         for (const w of wallets) {
             const p = posMap.get(w.idx);
-            if (p?.error) {
-                skipped.complex.push({ idx: w.idx, reason: p.error });
-                continue;
+            if (p?.error) { errorIdxs.add(w.idx); skipped.complex.push({ idx: w.idx, reason: p.error }); continue; }
+            if (p.open.length > 1) { skipped.complex.push({ idx: w.idx, reason: `${p.open.length} positions, 暂不支持` }); continue; }
+            if (p.open.length === 0) continue;
+            const op = p.open[0];
+            if (!symItems[op.symbol]) symItems[op.symbol] = { longs: [], shorts: [] };
+            const item = { w, vol: Math.abs(parseFloat(op.notional)), pos: op };
+            (op.riskDirection === "long" ? symItems[op.symbol].longs : symItems[op.symbol].shorts).push(item);
+        }
+
+        // 贪婪配对: 同 symbol long 跟 short 互相抵消, 配平的钱包视为"已配平"标记
+        const hedgeNeeded = [];   // 残留 ≥ 100, 需要 free partner
+        for (const [sym, g] of Object.entries(symItems)) {
+            const lq = g.longs.slice().sort((a, b) => b.vol - a.vol);
+            const sq = g.shorts.slice().sort((a, b) => b.vol - a.vol);
+            while (lq.length && sq.length) {
+                const L = lq[0], S = sq[0];
+                const m = Math.min(L.vol, S.vol);
+                L.vol -= m;
+                S.vol -= m;
+                if (L.vol <= TOLERANCE) lq.shift();
+                if (S.vol <= TOLERANCE) sq.shift();
             }
-            const absExp = Math.abs(p.netExposure || 0);
-            if (absExp <= POS_TOLERANCE) {
-                free.push(w);
-            } else if (p.open.length === 1) {
-                exposed.push({ w, position: p.open[0], netExposure: p.netExposure });
+            // 剩余 = 集合内未配平的残留 (单边)
+            for (const x of [...lq, ...sq]) {
+                if (x.vol <= TOLERANCE) continue;
+                exposedIdxs.add(x.w.idx);
+                if (x.vol < HEDGE_MIN_VOL) {
+                    cleanupPairs.push({ exposedWallet: x.w, position: x.pos });
+                } else {
+                    hedgeNeeded.push({ exposedWallet: x.w, position: x.pos });
+                }
+            }
+        }
+
+        // free pool = 不在 errorIdxs 且不在 exposedIdxs 的钱包
+        free = wallets.filter(w => !errorIdxs.has(w.idx) && !exposedIdxs.has(w.idx)
+            && (posMap.get(w.idx)?.open?.length || 0) === 0
+            ? true
+            : !exposedIdxs.has(w.idx) && !errorIdxs.has(w.idx));
+        // 上面三目稍乱, 简化: free = 完全无持仓 且不在 error/skipped 的钱包
+        free = wallets.filter(w => {
+            if (errorIdxs.has(w.idx)) return false;
+            const p = posMap.get(w.idx);
+            if (!p || p.error) return false;
+            if (p.open.length === 0) return true;
+            // 有持仓但已在集合内 paired (没进 exposedIdxs) → 视为 paired, skip
+            return false;
+        });
+
+        // hedge 配 free partner, 不够时退化为 cleanup
+        for (const h of hedgeNeeded) {
+            if (free.length > 0) {
+                const partner = free.shift();
+                hedgePairs.push({ exposedWallet: h.exposedWallet, freeWallet: partner, position: h.position });
             } else {
-                skipped.complex.push({ idx: w.idx, reason: `${p.open.length} positions, 暂不支持自动 hedge` });
+                cleanupPairs.push({ exposedWallet: h.exposedWallet, position: h.position });
             }
         }
     } else {
-        free = wallets;   // --force: 不查链上, 全部当 free
-    }
-
-    // --complete 模式: 分类 exposed 为 hedge / cleanup
-    //   - vol < 100 (minNotional): IOC 反向不可下, 用 close-position 自平 (cleanupPairs)
-    //   - vol ≥ 100 + 有 free 钱包: 拉 free 反向开 (hedgePairs)
-    //   - vol ≥ 100 + 无 free: 跳过 (warn)
-    const HEDGE_MIN_VOL = 100;   // USDT, 小于此值必须 close-position 自平
-    const hedgePairs = [];
-    const cleanupPairs = [];
-    if (complete && exposed.length > 0) {
-        for (const e of exposed) {
-            const vol = Math.abs(parseFloat(e.position.notional));
-            if (vol < HEDGE_MIN_VOL) {
-                cleanupPairs.push({ exposedWallet: e.w, position: e.position });
-                continue;
-            }
-            if (free.length === 0) {
-                skipped.exposedUnpaired.push(e);
-                continue;
-            }
-            const partner = free.shift();
-            hedgePairs.push({ exposedWallet: e.w, freeWallet: partner, position: e.position });
-        }
-    } else if (exposed.length > 0) {
-        // 默认: 不补, 跳过 exposed
-        for (const e of exposed) skipped.exposedUnpaired.push(e);
+        free = wallets;   // --force: 全部当 free shuffle
     }
 
     // Normal pair: 剩余 free 内部 shuffle 两两配对
@@ -594,7 +618,7 @@ async function main() {
     if (hedgePairs.length === 0 && normalPairs.length === 0 && cleanupPairs.length === 0) {
         console.log(`!! 没有可执行的 pair`);
         if (skipped.exposedUnpaired.length > 0) {
-            console.log(`   暴露但无 free 配对 (${skipped.exposedUnpaired.length} 个, ${complete ? "需要更多无持仓钱包" : "默认跳过, 加 --complete 让 free 反向补"}):`);
+            console.log(`   暴露但无 free 配对 (${skipped.exposedUnpaired.length} 个):`);
             for (const x of skipped.exposedUnpaired.slice(0, 20)) {
                 console.log(`     [${x.w.idx}] ${x.position.symbol} ${x.position.riskDirection} ${Math.abs(parseFloat(x.position.notional))}`);
             }
@@ -606,10 +630,10 @@ async function main() {
     }
 
     const totalPairs = hedgePairs.length + normalPairs.length + cleanupPairs.length;
-    console.log(`=== 配平开仓 (balance-open) ${dryRun ? "(DRY-RUN)" : "实盘"}${force ? " [FORCE]" : ""}${complete ? " [COMPLETE]" : ""} ===`);
+    console.log(`=== 配平开仓 (balance-open) ${dryRun ? "(DRY-RUN)" : "实盘"}${force ? " [FORCE]" : ""} ===`);
     console.log(`钱包: ${wallets.length} | free: ${freeShuffled.length} | exposed: ${exposed.length} (${hedgePairs.length} hedge + ${cleanupPairs.length} cleanup)${dropped ? ` | 落单: idx=${dropped.idx}` : ""} | 并发: ${concurrentPairs}`);
     console.log(`任务计划: ${cleanupPairs.length} 个 cleanup (残量<100 自平) + ${hedgePairs.length} 个 hedge (free 反向补) + ${normalPairs.length} 个 normal (新开) = ${totalPairs} 总`);
-    if (skipped.exposedUnpaired.length > 0) console.log(`!! 暴露但跳过 ${skipped.exposedUnpaired.length} 个 (${complete ? "没足够 free partner" : "默认跳过, 加 --complete 自动处理"})`);
+    if (skipped.exposedUnpaired.length > 0) console.log(`!! 暴露但无 free partner 跳过 ${skipped.exposedUnpaired.length}`);
     if (skipped.complex.length > 0) console.log(`!! 跳过 (查询失败/多持仓 ${skipped.complex.length}): ${skipped.complex.map(c => c.idx).join(",")}`);
     console.log(`notional: [${config.instant.notionalUsdRange.join(", ")}] (normal pair); hedge 量 = exposed 持仓量\n`);
 
