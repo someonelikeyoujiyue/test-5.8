@@ -699,7 +699,7 @@ async function main() {
                 done++;
                 if (done % 10 === 0) {
                     const el = ((Date.now() - t0) / 1000).toFixed(0);
-                    console.log(`[${ts()}] 进度 ${done}/${pairs.length} (${el}s)`);
+                    console.log(`[${ts()}] 进度 ${done}/${totalPairs} (${el}s)`);
                 }
             }
         })());
